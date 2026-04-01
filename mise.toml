@@ -1,0 +1,89 @@
+[tools]
+python = "3.12"
+uv = "latest"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+
+# ── Development ──────────────────────────────────────────────────────────────
+
+[tasks.install]
+description = "Install project dependencies"
+run = "uv pip install -e '.[gateway,worker]'"
+
+[tasks.gateway]
+description = "Run the API gateway locally (with hot-reload)"
+run = "uv run python main.py gateway"
+
+[tasks.worker]
+description = "Run a model worker locally (with hot-reload)"
+run = "uv run python main.py worker"
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+
+[tasks.generate]
+description = "Generate docker-compose.yaml from config.yaml"
+run = "uv run python generate_compose.py"
+
+[tasks.up]
+description = "Build and start the full Docker stack"
+depends = ["generate"]
+run = "docker compose up --build -d"
+
+[tasks.down]
+description = "Tear down the Docker stack"
+run = "docker compose down --volumes --remove-orphans"
+
+[tasks.logs]
+description = "Follow Docker compose logs"
+run = "docker compose logs -f"
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+
+[tasks.test]
+description = "Run the full integration test suite (build, test, teardown)"
+run = "./test.sh"
+
+[tasks."test:up"]
+description = "Start containers for testing (keep running)"
+run = "./test.sh --up"
+
+[tasks."test:down"]
+description = "Tear down test containers"
+run = "./test.sh --down"
+
+# ── Deploy ───────────────────────────────────────────────────────────────────
+
+[tasks."deploy:gcp"]
+description = "Build, push, and deploy all services to GCP Cloud Run"
+run = "uv run python deployment/gcp/deploy.py"
+
+[tasks."deploy:gcp:plan"]
+description = "Run terraform plan without rebuilding images"
+run = "uv run python deployment/gcp/deploy.py --plan --skip-build"
+
+[tasks."deploy:gcp:tf-only"]
+description = "Run terraform apply without rebuilding images already pushed"
+run = "uv run python deployment/gcp/deploy.py --skip-build"
+
+# ── Terraform ────────────────────────────────────────────────────────────────
+
+[tasks."tf:init"]
+description = "Initialize Terraform"
+dir = "deployment/gcp"
+run = "terraform init"
+
+[tasks."tf:plan"]
+description = "Run Terraform plan"
+dir = "deployment/gcp"
+run = "terraform plan"
+
+[tasks."tf:apply"]
+description = "Apply Terraform changes"
+dir = "deployment/gcp"
+run = "terraform apply"
+
+[tasks."tf:destroy"]
+description = "Destroy Terraform resources"
+dir = "deployment/gcp"
+run = "terraform destroy"

@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible bug in the repository
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please provide a minimal, reproducible description.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the bug and the observed behavior.
+      placeholder: The gateway returned 500 when ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: I expected ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include commands, inputs, model names, and deployment context.
+      placeholder: |
+        1. Configure model ...
+        2. Run ...
+        3. Call endpoint ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Gateway API
+        - Worker inference
+        - Local Docker flow
+        - GCP deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste relevant output, stack traces, or screenshots.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit, branch, or image version
+      placeholder: main / commit SHA / image tag

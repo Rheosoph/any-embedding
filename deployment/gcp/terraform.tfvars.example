@@ -1,0 +1,8 @@
+project_id     = "your-gcp-project-id"
+region         = "us-central1"
+api_key        = "CHANGE-ME-to-a-strong-random-key"
+gateway_image  = "us-central1-docker.pkg.dev/your-gcp-project-id/any-embedding/gateway:latest"
+image_registry = "us-central1-docker.pkg.dev/your-gcp-project-id/any-embedding/worker"
+cloud_run_deletion_protection = false
+tfstate_bucket = "your-gcp-project-id-tfstate"
+alert_email    = "your-team@example.com"

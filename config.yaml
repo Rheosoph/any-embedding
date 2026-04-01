@@ -1,0 +1,125 @@
+# any-embedding configuration
+# Define all models to deploy as embedding workers.
+
+gateway:
+  port: 8080
+
+models:
+  # Each entry becomes a separate Cloud Run worker service.
+  # "name" is the model ID clients use in the API request (model field).
+  # "model" is the HuggingFace / sentence-transformers model identifier.
+  # "type": "text" (default) or "image" (multimodal, e.g. CLIP).
+  # Clients are responsible for adding any model-specific prefixes to their input.
+  #
+  # Resource overrides (optional, defaults in terraform variables):
+  #   cpu, memory, gpu (bool), max_instances, min_instances, gated (bool)
+
+  - name: "bge-large-en-v1.5"
+    model: "BAAI/bge-large-en-v1.5"
+    type: "text"
+    max_tokens: 512
+    dimensions: 1024
+
+  - name: "gte-large-en-v1.5"
+    model: "Alibaba-NLP/gte-large-en-v1.5"
+    type: "text"
+    max_tokens: 8192
+    dimensions: 1024
+    sentence_transformers_version: "2.7.0"
+    transformers_version: "4.39.1"
+
+  - name: "e5-large-v2"
+    model: "intfloat/e5-large-v2"
+    type: "text"
+    max_tokens: 512
+    dimensions: 1024
+
+  - name: "qwen3-embedding-0.6b"
+    model: "Qwen/Qwen3-Embedding-0.6B"
+    type: "text"
+    max_tokens: 32768
+    dimensions: 1024
+    gpu: true
+    cpu: "4"
+    memory: "16Gi"
+    max_instances: 1
+
+  - name: "gte-multilingual-base"
+    model: "Alibaba-NLP/gte-multilingual-base"
+    type: "text"
+    max_tokens: 8192
+    dimensions: 768
+    sentence_transformers_version: "2.7.0"
+    transformers_version: "4.39.1"
+    gpu: true
+    cpu: "4"
+    memory: "16Gi"
+    max_instances: 1
+
+  - name: "multilingual-e5-large-instruct"
+    model: "intfloat/multilingual-e5-large-instruct"
+    type: "text"
+    max_tokens: 512
+    dimensions: 1024
+    gpu: true
+    cpu: "4"
+    memory: "16Gi"
+    max_instances: 1
+
+  # Gated model – requires HF_TOKEN with accepted license
+  - name: "embeddinggemma-300m"
+    model: "google/embeddinggemma-300m"
+    type: "text"
+    gated: true
+    max_tokens: 2048
+    dimensions: 768
+    gpu: true
+    cpu: "4"
+    memory: "16Gi"
+    max_instances: 1
+
+  # Jina v2 bilingual: EN/ZH – gated model, requires HF_TOKEN
+  # Jina v2 custom code is incompatible with transformers>=4.46, pin older version.
+  - name: "jina-embeddings-v2-base-zh"
+    model: "jinaai/jina-embeddings-v2-base-zh"
+    type: "text"
+    gated: true
+    max_tokens: 8192
+    dimensions: 768
+    memory: "8Gi"
+    transformers_version: "4.44.2"
+
+  # Jina v2 bilingual: DE/EN
+  - name: "jina-embeddings-v2-base-de"
+    model: "jinaai/jina-embeddings-v2-base-de"
+    type: "text"
+    max_tokens: 8192
+    dimensions: 768
+    memory: "8Gi"
+    transformers_version: "4.44.2"
+
+  # Jina v2 bilingual: EN/ES
+  - name: "jina-embeddings-v2-base-es"
+    model: "jinaai/jina-embeddings-v2-base-es"
+    type: "text"
+    max_tokens: 8192
+    dimensions: 768
+    memory: "8Gi"
+    transformers_version: "4.44.2"
+
+  # Jina v2 code: EN + 30 programming languages
+  - name: "jina-embeddings-v2-base-code"
+    model: "jinaai/jina-embeddings-v2-base-code"
+    type: "text"
+    max_tokens: 8192
+    dimensions: 768
+    transformers_version: "4.44.2"
+
+  # Example: multimodal image+text model with GPU
+  # - name: "clip-vit-large-patch14"
+  #   model: "openai/clip-vit-large-patch14"
+  #   type: "image"
+  #   dimensions: 768
+  #   gpu: true
+  #   cpu: "4"
+  #   memory: "16Gi"

@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+# Stage 1: Download model weights (HF_TOKEN mounted as BuildKit secret, never persisted in layers)
+FROM python:3.12-slim AS model-downloader
+
+WORKDIR /app
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir ".[worker]"
+
+ARG SENTENCE_TRANSFORMERS_VERSION=""
+ARG TRANSFORMERS_VERSION=""
+RUN if [ -n "$SENTENCE_TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "sentence-transformers==$SENTENCE_TRANSFORMERS_VERSION"; fi && \
+    if [ -n "$TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "transformers==$TRANSFORMERS_VERSION"; fi
+
+COPY app/ ./app/
+
+ARG MODEL_NAME=""
+ENV HF_HOME=/app/models
+ENV MODEL_PATH=/app/model
+RUN --mount=type=secret,id=HF_TOKEN \
+    mkdir -p /app/models && python app/download_model.py
+
+# Stage 2: GPU-enabled worker image using NVIDIA CUDA runtime.
+# Use this for models with gpu: true in config.yaml.
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+# Prevent interactive prompts during apt install
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Python 3.12 + curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common curl && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install PyTorch with CUDA support first (from PyTorch index), then the rest
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir \
+        torch --index-url https://download.pytorch.org/whl/cu124 && \
+    pip install --no-cache-dir ".[worker]"
+
+# Optional: pin transformers version for models with compat issues (e.g. Jina v2)
+ARG SENTENCE_TRANSFORMERS_VERSION=""
+ARG TRANSFORMERS_VERSION=""
+RUN if [ -n "$SENTENCE_TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "sentence-transformers==$SENTENCE_TRANSFORMERS_VERSION"; fi && \
+    if [ -n "$TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "transformers==$TRANSFORMERS_VERSION"; fi
+
+COPY app/ ./app/
+COPY config.yaml ./
+
+COPY --from=model-downloader /app/model /app/model
+
+ARG MODEL_NAME=""
+ENV MODEL_NAME=${MODEL_NAME}
+ENV MODEL_TYPE="text"
+ENV HF_HOME=/app/models
+ENV MODEL_PATH=/app/model
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+RUN addgroup --system app && adduser --system --ingroup app app && chown -R app:app /app/model
+USER app
+
+EXPOSE 8080
+
+CMD ["uvicorn", "app.worker:app", "--host", "0.0.0.0", "--port", "8080"]

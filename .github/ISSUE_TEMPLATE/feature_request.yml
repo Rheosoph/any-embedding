@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest an improvement to the project
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      placeholder: It is hard to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      placeholder: I would like ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where would this help?
+      options:
+        - Gateway API
+        - Worker inference
+        - Model configuration
+        - Local developer workflow
+        - GCP deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: I also considered ...
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      placeholder: Links, examples, constraints, or screenshots
