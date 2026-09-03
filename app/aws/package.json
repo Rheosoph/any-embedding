@@ -2,6 +2,7 @@
   "name": "any-embedding-aws-runtime",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "engines": {
     "node": "24.x",
     "npm": "11.x"

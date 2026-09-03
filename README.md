@@ -361,3 +361,7 @@ The Terraform stack references the two archives separately. MicroVM image releas
 ## What to build next
 
 If this project gets the attention it deserves, the obvious next layer is not a rewrite. It is observability, request accounting, and model-level traffic policy on top of the same gateway/worker split.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
