@@ -8,17 +8,18 @@ The goal of this repository is straightforward: one OpenAI-compatible embeddings
 
 - Check existing issues before opening a new one.
 - Keep pull requests focused. Small, reviewable changes move faster.
-- If your change affects deployment behavior, update the relevant documentation in `README.md` and `deployment/gcp/`.
+- If your change affects deployment behavior, update the relevant documentation in `README.md` and the corresponding `deployment/aws/` or `deployment/gcp/` directory.
 
 ## Local Setup
 
 Recommended toolchain:
 
+- Node.js 24
 - Python 3.12
 - `uv`
 - `mise`
 - Docker
-- Terraform, if you are changing the GCP deployment path
+- Terraform, if you are changing a cloud deployment path
 
 Install dependencies:
 
@@ -30,7 +31,7 @@ mise run install
 If you do not use `mise`:
 
 ```bash
-uv pip install -e '.[gateway,worker]'
+uv sync --extra gateway --extra worker
 ```
 
 ## Common Workflows
@@ -62,9 +63,16 @@ MODEL_NAME="BAAI/bge-large-en-v1.5" mise run worker
 If you work on deployment automation, the main entry points are:
 
 ```bash
+mise run check:aws
+mise run package:aws
+mise run package:aws-microvm
+mise run deploy:aws:plan
+mise run deploy:aws
 mise run deploy:gcp:plan
 mise run deploy:gcp:tf-only
 ```
+
+`deploy:aws:plan` builds the Lambda bundles and saves a reviewable Terraform plan. `deploy:aws` applies only that saved plan. Packaging the MicroVM source is deliberately separate from uploading it to S3 and publishing immutable image versions; follow [`deployment/aws/README.md`](deployment/aws/README.md) for that release sequence.
 
 ## Contribution Guidelines
 
@@ -92,6 +100,6 @@ Good contributions usually look like:
 - tightening validation or error handling
 - improving docs and deployment instructions
 - adding test coverage for gateway or worker behavior
-- improving Cloud Run or Docker ergonomics without changing the architecture
+- improving AWS, Cloud Run, or Docker ergonomics without changing the architecture
 
 Large architectural rewrites are much less likely to be accepted than focused improvements.

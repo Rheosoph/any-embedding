@@ -28,6 +28,11 @@ import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 GCP_DIR = os.path.join(REPO_ROOT, "deployment", "gcp")
+GCP_GATEWAY_DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile.gateway")
+GCP_WORKER_DOCKERFILES = {
+    False: os.path.join(REPO_ROOT, "Dockerfile.worker"),
+    True: os.path.join(REPO_ROOT, "Dockerfile.worker-gpu"),
+}
 HF_MODEL_FILE_URL = "https://huggingface.co/{}/resolve/main/config.json"
 CLOUD_RUN_GPU_REGIONS = {
     "asia-southeast1",
@@ -315,6 +320,7 @@ def main() -> None:
     gateway_image = tfvars.get("gateway_image", "")
     image_registry = tfvars.get("image_registry", "")
     region = tfvars.get("region", "")
+    tfstate_bucket = tfvars.get("tfstate_bucket", "")
 
     if not gateway_image or not image_registry:
         print(
@@ -325,6 +331,10 @@ def main() -> None:
 
     if not region:
         print("ERROR: region must be set in deployment/gcp/terraform.tfvars")
+        sys.exit(1)
+
+    if not tfstate_bucket:
+        print("ERROR: tfstate_bucket must be set in deployment/gcp/terraform.tfvars")
         sys.exit(1)
 
     validate_gcp_region(models, region)
@@ -351,7 +361,7 @@ def main() -> None:
         # ── Gateway ──────────────────────────────────────────────────
         build_and_push(
             tag=gateway_image,
-            dockerfile=os.path.join(REPO_ROOT, "Dockerfile.gateway"),
+            dockerfile=GCP_GATEWAY_DOCKERFILE,
             build_args={},
             secrets={},
             context=REPO_ROOT,
@@ -366,10 +376,7 @@ def main() -> None:
                 name = m["name"].replace(".", "-")
                 tag = f"{image_registry}-{name}:latest"
                 uses_gpu = m.get("gpu", False)
-                dockerfile = os.path.join(
-                    REPO_ROOT,
-                    "Dockerfile.worker-gpu" if uses_gpu else "Dockerfile.worker",
-                )
+                dockerfile = GCP_WORKER_DOCKERFILES[uses_gpu]
                 build_args = {
                     "MODEL_NAME": m["model"],
                     "SENTENCE_TRANSFORMERS_VERSION": m.get("sentence_transformers_version", ""),
@@ -403,7 +410,16 @@ def main() -> None:
     print(f"Running terraform {tf_cmd}")
     print(f"{'=' * 60}\n")
 
-    run(["terraform", "init", "-input=false", "-upgrade"], cwd=GCP_DIR)
+    run(
+        [
+            "terraform",
+            "init",
+            "-input=false",
+            "-upgrade",
+            f"-backend-config=bucket={tfstate_bucket}",
+        ],
+        cwd=GCP_DIR,
+    )
     if tf_cmd == "apply":
         unlock_stale_cloud_run_deletion_protection(region)
     tf_args = ["terraform", tf_cmd]

@@ -1,0 +1,29 @@
+{
+  "name": "any-embedding-aws-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": "24.x",
+    "npm": "11.x"
+  },
+  "packageManager": "npm@11.6.2",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.883.0",
+    "@aws-sdk/client-lambda-microvms": "^3.883.0",
+    "@aws-sdk/lib-dynamodb": "^3.883.0",
+    "@aws-sdk/util-dynamodb": "^3.883.0"
+  },
+  "scripts": {
+    "build": "node --import tsx build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test ../../tests/aws/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.163",
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}

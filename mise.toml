@@ -1,6 +1,8 @@
 [tools]
+jq = "1.7"
+node = "24"
 python = "3.12"
-uv = "latest"
+uv = "0.12.8"
 
 [env]
 _.python.venv = { path = ".venv", create = true }
@@ -9,7 +11,7 @@ _.python.venv = { path = ".venv", create = true }
 
 [tasks.install]
 description = "Install project dependencies"
-run = "uv pip install -e '.[gateway,worker]'"
+run = "uv sync --extra gateway --extra worker"
 
 [tasks.gateway]
 description = "Run the API gateway locally (with hot-reload)"
@@ -44,6 +46,18 @@ run = "docker compose logs -f"
 description = "Run the full integration test suite (build, test, teardown)"
 run = "./test.sh"
 
+[tasks."check:aws"]
+description = "Type-check and test the AWS runtime and benchmark harness"
+run = "npm --prefix app/aws ci --ignore-scripts && npm --prefix app/aws run check && python3 -m unittest discover -s deployment/aws/benchmarks/function-url -p 'test_*.py' && python3 -m unittest discover -s deployment/aws/benchmarks/microvm -p 'test_*.py'"
+
+[tasks."package:aws"]
+description = "Build deterministic gateway and lifecycle Lambda archives"
+run = "./deployment/aws/scripts/deploy.sh package"
+
+[tasks."package:aws-microvm"]
+description = "Validate and package the locked AWS MicroVM source"
+run = "./deployment/aws/scripts/deploy.sh package-microvm"
+
 [tasks."test:up"]
 description = "Start containers for testing (keep running)"
 run = "./test.sh --up"
@@ -65,6 +79,14 @@ run = "uv run python deployment/gcp/deploy.py --plan --skip-build"
 [tasks."deploy:gcp:tf-only"]
 description = "Run terraform apply without rebuilding images already pushed"
 run = "uv run python deployment/gcp/deploy.py --skip-build"
+
+[tasks."deploy:aws:plan"]
+description = "Build the AWS Lambda bundles and save a reviewed Terraform plan"
+run = "./deployment/aws/scripts/deploy.sh plan"
+
+[tasks."deploy:aws"]
+description = "Apply the exact saved AWS Terraform plan"
+run = "./deployment/aws/scripts/deploy.sh apply"
 
 # ── Terraform ────────────────────────────────────────────────────────────────
 

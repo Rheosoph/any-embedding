@@ -1,0 +1,34 @@
+# Lambda MicroVM images and their S3 artifacts are Region-bound. The built-in
+# model catalog derives image ARNs from the active AWS account and this Region.
+aws_region  = "eu-west-1"
+name_prefix = "any-embedding"
+environment = "ireland"
+
+# Store only the digest in Terraform, never the plaintext key. Generate it with:
+#   source deployment/aws/scripts/lib/common.sh
+#   printf %s 'replace-with-a-long-random-key' | sha256_files
+# Prefer TF_VAR_api_key_sha256 or an untracked *.auto.tfvars file in automation.
+api_key_sha256 = "REPLACE_WITH_A_64_CHARACTER_LOWERCASE_SHA256_DIGEST"
+
+# The default model map has measured, cost-biased lifecycle windows per tier:
+# small 485s running + 1315s suspended; medium 255+1545; large 145+1655.
+# Override `models` as a whole to tune those tier-local values.
+microvm_max_duration_seconds = 25200
+
+gateway_reserved_concurrency   = 50
+lifecycle_reserved_concurrency = 2
+log_retention_days              = 30
+
+# Add SNS topic ARNs to receive alarm/OK notifications.
+alarm_actions = []
+
+tags = {
+  CostCenter = "embedding"
+  Owner      = "platform"
+}
+
+# The defaults reference conventional version-1.0 gte-multilingual-base image
+# names in the active account. Override the whole map when adding another model,
+# using differently named images, or changing tiers.
+# See ../README.md for the row contract and modules/microvm-image-awscc for
+# optional explicit image management.

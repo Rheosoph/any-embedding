@@ -1,0 +1,11 @@
+/artifacts/
+/benchmarks/**/results/
+/docs/created-resources.md
+/docs/inventories/
+/terraform/.terraform/
+/terraform/*.tfstate
+/terraform/*.tfstate.*
+/terraform/*.tfplan
+/terraform/*.tfvars
+/terraform/*.tfvars.json
+/terraform/build/

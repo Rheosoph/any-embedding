@@ -3,9 +3,28 @@ __pycache__/
 *.pyo
 .venv/
 .env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+.direnv/
 *.egg-info/
 dist/
 build/
+node_modules/
+
+# Local cloud credentials and private keys
+.aws/
+.gcloud/
+.secrets/
+.credentials/
+**/application_default_credentials.json
+**/*service-account-key*.json
+**/*service-account-credentials*.json
+*.key
+*.pem
+*.p12
+*.pfx
 
 # IDE
 .idea/
@@ -21,9 +40,23 @@ Thumbs.db
 # Terraform
 **/.terraform/
 *.tfstate
-*.tfstate.backup
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+*.tfvars
+*.tfvars.json
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
 .terraform.lock.hcl
-**/terraform.tfvars
+# Application deployment roots pin providers; reusable child modules do not.
+!deployment/aws/terraform/.terraform.lock.hcl
+!deployment/gcp/.terraform.lock.hcl
 
 # Docker
 .docker/
@@ -36,3 +69,4 @@ models/
 
 #Ignore vscode AI rules
 .github/instructions/codacy.instructions.md
+.codacy/codacy.yaml

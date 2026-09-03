@@ -4,6 +4,7 @@
   <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white" />
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-OpenAI%20compatible-009688?logo=fastapi&logoColor=white" />
   <img alt="Google Cloud" src="https://img.shields.io/badge/Google%20Cloud-Cloud%20Run%20GPU-4285F4?logo=googlecloud&logoColor=white" />
+  <img alt="AWS" src="https://img.shields.io/badge/AWS-Lambda%20MicroVMs-FF9900?logo=amazonaws&logoColor=white" />
 </p>
 
 A high-performance control plane for self-hosted embeddings.
@@ -14,7 +15,7 @@ A high-performance control plane for self-hosted embeddings.
   Serverless gateway on Google Cloud Run, with isolated CPU and GPU embedding workers behind it.
 </p>
 
-any-embedding gives you one OpenAI-compatible endpoint in front of a fleet of sentence-transformers models, with per-model workers, baked model images, and a clean path from local Docker Compose to a production-grade Google Cloud Run deployment.
+any-embedding gives you one OpenAI-compatible endpoint in front of a fleet of sentence-transformers models, with per-model workers, baked model images, and provider-specific deployments for Google Cloud Run and AWS Lambda MicroVMs.
 
 It is built for the reality of modern embedding infrastructure:
 - the leaderboard changes constantly
@@ -37,7 +38,7 @@ It is built for the reality of modern embedding infrastructure:
 Client
   |
   v
-Gateway (FastAPI, Cloud Run or local)
+Gateway (Cloud Run, Lambda Function URL, or local)
   - API key auth
   - OpenAI-compatible /v1/embeddings
   - model registry loaded from config.yaml
@@ -63,6 +64,7 @@ This repo is no longer just a demo wrapper around sentence-transformers. The cur
 - SSRF protection for remote image URLs in multimodal workers.
 - Secret Manager and CMEK-backed secret storage in the GCP deployment.
 - Monitoring, uptime checks, and alerting in the GCP Terraform stack.
+- DynamoDB lease fencing, native suspend/resume, reconciliation, and alarms in the AWS Terraform stack.
 
 ## Model catalog
 
@@ -144,10 +146,10 @@ mise run gateway
 Without `mise`, you can install directly:
 
 ```bash
-uv pip install -e '.[gateway,worker]'
+uv sync --extra gateway --extra worker
 ```
 
-Available task entry points live in [mise.toml](mise.toml), including local run, test, and GCP deploy flows.
+Available task entry points live in [mise.toml](mise.toml), including local run, test, and AWS/GCP build and deploy flows.
 
 ## API
 
@@ -302,12 +304,45 @@ Terraform will:
 - [deployment/gcp/test_backend.sh](deployment/gcp/test_backend.sh) validates the live deployment against every model in [config.yaml](config.yaml).
 - [deployment/gcp/terraform.tfvars.example](deployment/gcp/terraform.tfvars.example) is the starting point for project-specific values.
 
+The GCS backend is partially configured: `deploy.py` supplies `tfstate_bucket`
+from the ignored `terraform.tfvars`, so the committed Terraform provider file
+contains no project-specific bucket identifier.
+
+## Deploy to AWS
+
+The AWS stack targets `eu-west-1` (Ireland). Its public, OpenAI-compatible Function URL is emitted only as a Terraform output; `/v1/models` and `/v1/embeddings` use the same bearer-key contract as GCP. The control plane is strict TypeScript targeting Node.js 24. esbuild turns it into independent gateway and lifecycle bundles, while the Python MicroVM worker is a separate uv project with its own `pyproject.toml` and committed `uv.lock`.
+
+Build both checked Lambda packages from the repository root:
+
+```bash
+./deployment/aws/scripts/package-lambdas.sh
+```
+
+For a standalone quality check without packaging:
+
+```bash
+npm --prefix app/aws ci --ignore-scripts
+npm --prefix app/aws run check
+```
+
+The Terraform stack references the two archives separately. MicroVM image releases use a distinct package, S3 upload, and immutable publish workflow; Ireland currently serves `gte-multilingual-base` image version `1.0` in 2/4/8 GiB tiers. In the matched live run, AWS's observed first request was 4.87 seconds versus GCP's 17.34 seconds, while GCP was faster for warm, batched, concurrent, and long-input work. The nominal continuously allocated baseline is $669.11 per 720 hours for one of every AWS tier versus $753.49 for the configured GCP L4 worker; this is not a throughput-equivalent comparison. See the [AWS deployment guide](deployment/aws/README.md), [benchmark report](deployment/aws/docs/benchmarks.md), and [cost model](deployment/aws/docs/costs.md).
+
+### AWS layout
+
+- [app/aws](app/aws) contains the TypeScript Function URL gateway, tier router, pool registry, lifecycle reconciler, and uv-locked MicroVM worker; its tests live in [tests/aws](tests/aws).
+- [deployment/aws](deployment/aws) separates the Ireland Terraform root, release scripts, benchmark harnesses, and sanitized documentation. Raw benchmark captures, resource inventories, and endpoint-specific handoff files stay in ignored local artifacts.
+- AWS workers use real Lambda MicroVMs; only the small public router and lifecycle reconciler are ordinary Lambda functions.
+
 ## Project structure
 
-- [app/gateway.py](app/gateway.py) - auth, model registry, request forwarding
-- [app/worker.py](app/worker.py) - model loading and embedding inference
+- [app/gcp](app/gcp) - Cloud Run gateway, workers, and model downloader
+- [app/aws](app/aws) - TypeScript Lambda control plane and standalone uv-locked MicroVM worker
+- [tests/aws](tests/aws) - TypeScript tests for the AWS request contract, routing, pool, MicroVM client, and lifecycle logic
+- [app/shared](app/shared) - provider-neutral Python API models
+- [app/gateway.py](app/gateway.py) and [app/worker.py](app/worker.py) - backward-compatible GCP import shims
 - [config.yaml](config.yaml) - model fleet definition
 - [generate_compose.py](generate_compose.py) - local stack generation
+- [deployment/aws](deployment/aws) - organized Lambda MicroVM Terraform, deployment scripts, benchmarks, and cost documentation
 - [deployment/gcp/deploy.py](deployment/gcp/deploy.py) - build, push, and deploy orchestration for GCP
 - [deployment/gcp/main.tf](deployment/gcp/main.tf) - Cloud Run services, IAM, secrets, logging, monitoring, GPU configuration
 - [deployment/gcp/test_backend.sh](deployment/gcp/test_backend.sh) - live backend validation after deploy

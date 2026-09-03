@@ -16,4 +16,4 @@ ENV CONFIG_PATH="config.yaml"
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.gateway:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app.gcp.gateway:app", "--host", "0.0.0.0", "--port", "8080"]

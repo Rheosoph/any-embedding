@@ -17,7 +17,7 @@ ARG MODEL_NAME=""
 ENV HF_HOME=/app/models
 ENV MODEL_PATH=/app/model
 RUN --mount=type=secret,id=HF_TOKEN \
-    mkdir -p /app/models && python app/download_model.py
+    mkdir -p /app/models && python app/gcp/download_model.py
 
 # Stage 2: GPU-enabled worker image using NVIDIA CUDA runtime.
 # Use this for models with gpu: true in config.yaml.
@@ -71,4 +71,4 @@ USER app
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.worker:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app.gcp.worker:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -13,7 +13,6 @@ terraform {
   }
 
   backend "gcs" {
-    bucket = "flow-like-tfstate"
     prefix = "any-embedding/gcp"
   }
 }

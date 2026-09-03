@@ -10,6 +10,12 @@ import os
 
 import yaml
 
+GCP_GATEWAY_DOCKERFILE = "Dockerfile.gateway"
+GCP_WORKER_DOCKERFILES = {
+    False: "Dockerfile.worker",
+    True: "Dockerfile.worker-gpu",
+}
+
 
 def sanitize_env_key(name: str) -> str:
     return "WORKER_URL_" + name.replace("-", "_").replace(".", "_").upper()
@@ -42,7 +48,7 @@ def main() -> None:
         svc: dict = {
             "build": {
                 "context": ".",
-                "dockerfile": "Dockerfile.worker-gpu" if uses_gpu else "Dockerfile.worker",
+                "dockerfile": GCP_WORKER_DOCKERFILES[uses_gpu],
                 "args": {
                     "MODEL_NAME": m["model"],
                     **({"SENTENCE_TRANSFORMERS_VERSION": m["sentence_transformers_version"]} if m.get("sentence_transformers_version") else {}),
@@ -86,7 +92,7 @@ def main() -> None:
         gateway_depends.append(svc_name)
 
     services["gateway"] = {
-        "build": {"context": ".", "dockerfile": "Dockerfile.gateway"},
+        "build": {"context": ".", "dockerfile": GCP_GATEWAY_DOCKERFILE},
         "environment": gateway_env,
         "ports": ["8080:8080"],
         "depends_on": {
