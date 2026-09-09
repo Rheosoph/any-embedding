@@ -3,17 +3,14 @@
 FROM python:3.12-slim AS model-downloader
 
 WORKDIR /app
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir ".[worker]"
-
-ARG SENTENCE_TRANSFORMERS_VERSION=""
-ARG TRANSFORMERS_VERSION=""
-RUN if [ -n "$SENTENCE_TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "sentence-transformers==$SENTENCE_TRANSFORMERS_VERSION"; fi && \
-    if [ -n "$TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "transformers==$TRANSFORMERS_VERSION"; fi
+# Downloading weights and source code needs no inference runtime.
+RUN pip install --no-cache-dir "huggingface-hub>=0.20,<1.0"
 
 COPY app/ ./app/
 
 ARG MODEL_NAME=""
+ARG MODEL_CODE_REPO=""
+ARG MODEL_CODE_REVISION=""
 ENV HF_HOME=/app/models
 ENV MODEL_PATH=/app/model
 RUN --mount=type=secret,id=HF_TOKEN \
@@ -54,19 +51,22 @@ RUN if [ -n "$SENTENCE_TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir 
 COPY app/ ./app/
 COPY config.yaml ./
 
-COPY --from=model-downloader /app/model /app/model
+RUN addgroup --system app && adduser --system --ingroup app app
+COPY --from=model-downloader --chown=app:app /app/model /app/model
 
 ARG MODEL_NAME=""
 ENV MODEL_NAME=${MODEL_NAME}
 ENV MODEL_TYPE="text"
-ENV HF_HOME=/app/models
+ENV HF_HOME=/tmp/hf-home
 ENV MODEL_PATH=/app/model
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-RUN addgroup --system app && adduser --system --ingroup app app && chown -R app:app /app/model
+# Compile app and bundled custom code while the image is built. Site packages
+# are already byte-compiled by pip.
+RUN python -m compileall -q /app/app /app/model
 USER app
 
 EXPOSE 8080

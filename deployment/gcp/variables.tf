@@ -25,6 +25,12 @@ variable "image_registry" {
   type        = string
 }
 
+variable "worker_images" {
+  description = "Per-model immutable image URIs resolved by deploy.py; overrides the registry :latest fallback"
+  type        = map(string)
+  default     = {}
+}
+
 variable "config_path" {
   description = "Path to config.yaml (relative to deployment/gcp dir)"
   type        = string
@@ -66,6 +72,28 @@ variable "gateway_cpu" {
   description = "CPU allocation for the gateway"
   type        = string
   default     = "1"
+}
+
+variable "gateway_min_instances" {
+  description = "Minimum warm gateway instances (1 avoids scale-from-zero on the routing hop)"
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.gateway_min_instances >= 0 && var.gateway_min_instances <= 5 && floor(var.gateway_min_instances) == var.gateway_min_instances
+    error_message = "gateway_min_instances must be an integer between 0 and 5."
+  }
+}
+
+variable "worker_timeout_seconds" {
+  description = "Gateway deadline for worker auth and inference; set below the consumer timeout with transport headroom"
+  type        = number
+  default     = 120
+
+  validation {
+    condition     = var.worker_timeout_seconds > 0 && var.worker_timeout_seconds < 300 && floor(var.worker_timeout_seconds) == var.worker_timeout_seconds
+    error_message = "worker_timeout_seconds must be an integer between 1 and 299 (workers time out at 300s)."
+  }
 }
 
 variable "gateway_memory" {

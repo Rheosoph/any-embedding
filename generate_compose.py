@@ -53,6 +53,8 @@ def main() -> None:
                     "MODEL_NAME": m["model"],
                     **({"SENTENCE_TRANSFORMERS_VERSION": m["sentence_transformers_version"]} if m.get("sentence_transformers_version") else {}),
                     **({"TRANSFORMERS_VERSION": m["transformers_version"]} if m.get("transformers_version") else {}),
+                    **({"MODEL_CODE_REPO": m["model_code_repo"]} if m.get("model_code_repo") else {}),
+                    **({"MODEL_CODE_REVISION": m["model_code_revision"]} if m.get("model_code_revision") else {}),
                 },
                 **({"secrets": ["hf_token"]} if hf_token else {}),
             },

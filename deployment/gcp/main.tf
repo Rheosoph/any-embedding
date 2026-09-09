@@ -174,8 +174,9 @@ resource "google_cloud_run_v2_service" "worker" {
   }
 
   template {
-    service_account               = google_service_account.worker.email
-    gpu_zonal_redundancy_disabled = try(each.value.gpu, false)
+    service_account                  = google_service_account.worker.email
+    gpu_zonal_redundancy_disabled    = try(each.value.gpu, false)
+    max_instance_request_concurrency = try(each.value.concurrency, 80)
 
     scaling {
       min_instance_count = try(each.value.min_instances, var.worker_min_instances)
@@ -193,7 +194,7 @@ resource "google_cloud_run_v2_service" "worker" {
     containers {
       # Each model has its own image with weights baked in:
       # <registry>-<model-name>:latest
-      image = "${var.image_registry}-${replace(each.key, ".", "-")}:latest"
+      image = lookup(var.worker_images, each.key, "${var.image_registry}-${replace(each.key, ".", "-")}:latest")
 
       resources {
         limits = merge(
@@ -218,16 +219,24 @@ resource "google_cloud_run_v2_service" "worker" {
         value = try(each.value.type, "text")
       }
       env {
+        name  = "MODEL_BATCH_SIZE"
+        value = tostring(try(each.value.batch_size, 32))
+      }
+      env {
+        name  = "MODEL_WARMUP"
+        value = tostring(try(each.value.warmup, false))
+      }
+      env {
         name  = "HF_HOME"
         value = "/tmp/hf-home"
       }
       env {
         name  = "HF_HUB_OFFLINE"
-        value = "0"
+        value = try(each.value.offline, false) ? "1" : "0"
       }
       env {
         name  = "TRANSFORMERS_OFFLINE"
-        value = "0"
+        value = try(each.value.offline, false) ? "1" : "0"
       }
 
       dynamic "env" {
@@ -316,7 +325,7 @@ resource "google_cloud_run_v2_service" "gateway" {
     service_account = google_service_account.gateway.email
 
     scaling {
-      min_instance_count = 0
+      min_instance_count = var.gateway_min_instances
       max_instance_count = 5
     }
 
@@ -328,7 +337,8 @@ resource "google_cloud_run_v2_service" "gateway" {
           cpu    = var.gateway_cpu
           memory = var.gateway_memory
         }
-        cpu_idle = true
+        cpu_idle          = true
+        startup_cpu_boost = true
       }
 
       env {
@@ -339,6 +349,10 @@ resource "google_cloud_run_v2_service" "gateway" {
             version = "latest"
           }
         }
+      }
+      env {
+        name  = "WORKER_TIMEOUT_SECONDS"
+        value = tostring(var.worker_timeout_seconds)
       }
 
       # Inject worker URLs as environment variables: WORKER_URL_<SANITIZED_NAME>
@@ -364,6 +378,8 @@ resource "google_cloud_run_v2_service" "gateway" {
         timeout_seconds       = 2
       }
     }
+    # Leave time for the gateway to return its own upstream timeout response.
+    timeout = "${var.worker_timeout_seconds + 30}s"
   }
 }
 

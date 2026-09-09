@@ -6,3 +6,9 @@ image_registry = "us-central1-docker.pkg.dev/your-gcp-project-id/any-embedding/w
 cloud_run_deletion_protection = false
 tfstate_bucket = "your-gcp-project-id-tfstate"
 alert_email    = "your-team@example.com"
+
+# Scale to zero; no reserved warm gateway or worker instances.
+gateway_min_instances = 0
+worker_min_instances  = 0
+# Gateway auth + worker deadline: leave headroom below the consumer timeout.
+# worker_timeout_seconds = 120

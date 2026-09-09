@@ -96,6 +96,8 @@ Supported per-model overrides:
 - `min_instances`
 - `sentence_transformers_version`
 - `transformers_version`
+- `concurrency`, `batch_size`, `warmup`, `offline` (GCP serving)
+- `model_code_repo`, `model_code_revision` (bake pinned external model code)
 
 This is the core design choice in the repo: configuration defines the fleet, and both local development and cloud deployment consume the same source of truth.
 
@@ -301,6 +303,7 @@ Terraform will:
 
 - [deployment/gcp/deploy.py](deployment/gcp/deploy.py) builds and pushes images, then runs Terraform.
 - [deployment/gcp/main.tf](deployment/gcp/main.tf) defines Cloud Run services, IAM, secrets, logging, and monitoring.
+- [GCP latency guide](deployment/gcp/README.md) covers offline startup, concurrency, consumer deadlines, and image digest rollouts with scale to zero.
 - [deployment/gcp/test_backend.sh](deployment/gcp/test_backend.sh) validates the live deployment against every model in [config.yaml](config.yaml).
 - [deployment/gcp/terraform.tfvars.example](deployment/gcp/terraform.tfvars.example) is the starting point for project-specific values.
 

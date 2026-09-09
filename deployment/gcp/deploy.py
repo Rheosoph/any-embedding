@@ -198,6 +198,53 @@ def build_and_push(
     return tag
 
 
+def resolve_image_digest(image_reference: str) -> str:
+    """Resolve a registry tag to the immutable image Terraform must deploy."""
+    result = run(
+        [
+            "gcloud", "artifacts", "docker", "images", "describe", image_reference,
+            "--format=value(image_summary.fully_qualified_digest)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    resolved = result.stdout.strip()
+    match = re.fullmatch(
+        r"(?P<repository>(?:[a-z0-9-]+-docker\.pkg\.dev|(?:[a-z]+\.)?gcr\.io)"
+        r"/[a-zA-Z0-9._/-]+)@sha256:[0-9a-f]{64}",
+        resolved,
+    )
+    repository = image_reference.split("@", 1)[0]
+    prefix, separator, image_name = repository.rpartition("/")
+    repository = prefix + separator + image_name.split(":", 1)[0]
+    registry, _, path = repository.partition("/")
+    # Artifact Registry's describe command canonicalizes migrated gcr.io URLs.
+    gcr_locations = {
+        "gcr.io": "us", "us.gcr.io": "us", "eu.gcr.io": "europe", "asia.gcr.io": "asia",
+    }
+    if registry in gcr_locations:
+        project, _, image_path = path.partition("/")
+        repository = f"{gcr_locations[registry]}-docker.pkg.dev/{project}/{registry}/{image_path}"
+    if not match or match.group("repository") != repository:
+        raise ValueError(f"Registry did not return a valid immutable digest for {image_reference}")
+    if "@" in image_reference and resolved.rsplit("@", 1)[1] != image_reference.rsplit("@", 1)[1]:
+        raise ValueError(f"Registry returned a different digest for {image_reference}")
+    return resolved
+
+
+def resolve_deployment_images(gateway_image: str, image_registry: str, models: list[dict]) -> dict:
+    """Pin both freshly built and --skip-build images before Terraform planning."""
+    return {
+        "gateway_image": resolve_image_digest(gateway_image),
+        "worker_images": {
+            model["name"]: resolve_image_digest(
+                f"{image_registry}-{model['name'].replace('.', '-')}:latest"
+            )
+            for model in models
+        },
+    }
+
+
 def worker_service_name(model_name: str) -> str:
     """Keep Python deploy naming aligned with Terraform worker service names."""
     sanitized = model_name.replace(".", "-")
@@ -381,6 +428,8 @@ def main() -> None:
                     "MODEL_NAME": m["model"],
                     "SENTENCE_TRANSFORMERS_VERSION": m.get("sentence_transformers_version", ""),
                     "TRANSFORMERS_VERSION": m.get("transformers_version", ""),
+                    "MODEL_CODE_REPO": m.get("model_code_repo", ""),
+                    "MODEL_CODE_REVISION": m.get("model_code_revision", ""),
                 }
                 secrets = {"HF_TOKEN": hf_token}
                 fut = pool.submit(
@@ -404,6 +453,9 @@ def main() -> None:
         print("Skipping image build/push; Terraform will reuse the images already present in the registry.")
         print("If you changed app code or a Dockerfile, rerun deploy without --skip-build so Cloud Run gets a new image.")
 
+    print("\nResolving registry images to immutable digests...")
+    deployment_images = resolve_deployment_images(gateway_image, image_registry, models)
+
     # ── Terraform ────────────────────────────────────────────────────
     tf_cmd = "plan" if args.plan else "apply"
     print(f"\n{'=' * 60}")
@@ -426,7 +478,12 @@ def main() -> None:
     if tf_cmd == "apply":
         tf_args += ["-parallelism=1"]
         tf_args.append("-auto-approve")
-    run(tf_args, cwd=GCP_DIR)
+    # Explicit -var-file overrides terraform.tfvars (TF_VAR_* would not), and a
+    # changed digest creates a new Cloud Run revision even when :latest is reused.
+    with tempfile.NamedTemporaryFile("w", suffix=".tfvars.json") as image_tfvars:
+        json.dump(deployment_images, image_tfvars)
+        image_tfvars.flush()
+        run([*tf_args, f"-var-file={image_tfvars.name}"], cwd=GCP_DIR)
 
     print(f"\n✓ deploy:gcp {'(plan)' if args.plan else ''} complete")
 

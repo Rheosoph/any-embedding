@@ -7,8 +7,12 @@ Lightweight router that:
 - Exposes the OpenAI-compatible /v1/embeddings endpoint
 """
 
+import asyncio
+import base64
 import hmac
+import json
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -97,19 +101,98 @@ _GCE_METADATA_URL = (
 )
 
 
-async def _get_id_token(audience: str) -> str | None:
-    """Fetch a Google Cloud ID token from the metadata server (Cloud Run only)."""
+_TOKEN_EXPIRY_MARGIN_SECONDS = 60.0
+_METADATA_FAILURE_CACHE_SECONDS = 10.0
+
+
+def _worker_timeout_seconds() -> float:
+    """Reject invalid deadlines when the service starts."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                _GCE_METADATA_URL,
-                params={"audience": audience},
-                headers={"Metadata-Flavor": "Google"},
-            )
-            resp.raise_for_status()
-            return resp.text
-    except Exception:
+        timeout = float(os.environ.get("WORKER_TIMEOUT_SECONDS", "120"))
+    except ValueError as exc:
+        raise ValueError("WORKER_TIMEOUT_SECONDS must be a finite positive number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("WORKER_TIMEOUT_SECONDS must be a finite positive number")
+    return timeout
+
+
+def _token_expiry(token: str) -> float | None:
+    """Read expiry for caching only; Cloud Run validates the token signature."""
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        expiry = float(claims["exp"])
+        return expiry if math.isfinite(expiry) else None
+    except (ValueError, KeyError, IndexError, TypeError, OverflowError):
         return None
+
+
+class _IDTokenProvider:
+    """Reuse metadata tokens per audience and coalesce concurrent refreshes."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+        self.tokens: dict[str, tuple[str, float]] = {}
+        self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.metadata_unavailable_until = 0.0
+
+    def _cached_token(self, audience: str) -> str | None:
+        cached = self.tokens.get(audience)
+        if cached and cached[1] > time.time() + _TOKEN_EXPIRY_MARGIN_SECONDS:
+            return cached[0]
+        self.tokens.pop(audience, None)
+        return None
+
+    async def get_token(self, audience: str) -> str | None:
+        started = time.monotonic()
+        outcome = "interrupted"
+        try:
+            async with self.locks[audience]:
+                cached = self._cached_token(audience)
+                if cached:
+                    outcome = "cache_hit"
+                    return cached
+                if time.monotonic() < self.metadata_unavailable_until:
+                    outcome = "metadata_backoff"
+                    return None
+                try:
+                    resp = await self.client.get(
+                        _GCE_METADATA_URL,
+                        params={"audience": audience},
+                        headers={"Metadata-Flavor": "Google"},
+                    )
+                    resp.raise_for_status()
+                except httpx.HTTPError:
+                    # Local workers need no Cloud Run token. Bound the penalty
+                    # while still retrying metadata after transient failures.
+                    self.metadata_unavailable_until = (
+                        time.monotonic() + _METADATA_FAILURE_CACHE_SECONDS
+                    )
+                    outcome = "metadata_unavailable"
+                    return None
+                token = resp.text
+                expiry = _token_expiry(token)
+                if expiry is not None and expiry > time.time() + _TOKEN_EXPIRY_MARGIN_SECONDS:
+                    self.tokens[audience] = (token, expiry)
+                    outcome = "refreshed"
+                else:
+                    outcome = "uncacheable"
+                return token
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+            logger.info(
+                "id_token_lookup outcome=%s elapsed_ms=%.2f",
+                outcome,
+                elapsed_ms,
+                extra={
+                    "elapsed_ms": elapsed_ms,
+                    "outcome": outcome,
+                },
+            )
+
+
+async def _get_id_token(audience: str) -> str | None:
+    return await app.state.id_token_provider.get_token(audience)
 
 
 MODEL_REGISTRY: dict[str, ModelConfig] = {}
@@ -135,9 +218,17 @@ def _check_rate_limit(client_ip: str) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global MODEL_REGISTRY
+    timeout = _worker_timeout_seconds()
     MODEL_REGISTRY = _load_model_registry()
-    logger.info("Gateway ready with %d model(s)", len(MODEL_REGISTRY))
-    yield
+    async with (
+        httpx.AsyncClient(timeout=timeout) as worker_client,
+        httpx.AsyncClient(timeout=5.0) as metadata_client,
+    ):
+        _app.state.worker_client = worker_client
+        _app.state.id_token_provider = _IDTokenProvider(metadata_client)
+        _app.state.worker_timeout_seconds = timeout
+        logger.info("Gateway ready with %d model(s)", len(MODEL_REGISTRY))
+        yield
 
 
 app = FastAPI(title="any-embedding gateway", lifespan=lifespan)
@@ -210,16 +301,52 @@ async def create_embeddings(
 
     worker_url = model_cfg["worker_url"].rstrip("/")
 
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    id_token = await _get_id_token(worker_url)
-    if id_token:
-        headers["Authorization"] = f"Bearer {id_token}"
+    started = time.monotonic()
+    worker_started: float | None = None
+    status: int | None = None
+    try:
+        # HTTPX timeouts apply to individual I/O operations. This deadline also
+        # bounds token acquisition, pool waits, and the full response transfer.
+        async with asyncio.timeout(http_request.app.state.worker_timeout_seconds):
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            id_token = await _get_id_token(worker_url)
+            if id_token:
+                headers["Authorization"] = f"Bearer {id_token}"
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            f"{worker_url}/embed",
-            content=request.model_dump_json(),
-            headers=headers,
+            worker_started = time.monotonic()
+            resp = await http_request.app.state.worker_client.post(
+                f"{worker_url}/embed",
+                content=request.model_dump_json(),
+                headers=headers,
+            )
+            status = resp.status_code
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        status = 504
+        _audit_log(http_request, request.model, status)
+        raise HTTPException(status_code=status, detail="Embedding worker timed out") from exc
+    except httpx.RequestError as exc:
+        status = 502
+        _audit_log(http_request, request.model, status)
+        raise HTTPException(status_code=status, detail="Embedding worker unavailable") from exc
+    finally:
+        finished = time.monotonic()
+        elapsed_ms = round((finished - started) * 1000, 2)
+        worker_elapsed_ms = (
+            round((finished - worker_started) * 1000, 2)
+            if worker_started is not None else None
+        )
+        logger.info(
+            "worker_forward model=%s status=%s elapsed_ms=%.2f worker_elapsed_ms=%s",
+            request.model,
+            status,
+            elapsed_ms,
+            worker_elapsed_ms,
+            extra={
+                "model": request.model,
+                "status": status,
+                "elapsed_ms": elapsed_ms,
+                "worker_elapsed_ms": worker_elapsed_ms,
+            },
         )
 
     if resp.status_code != 200:

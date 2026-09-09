@@ -12,9 +12,12 @@ import ipaddress
 import logging
 import os
 import socket
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
+
+_BOOT_STARTED = time.perf_counter()
 
 import httpx
 import torch
@@ -43,6 +46,10 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "")
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "text")
 HF_HOME = os.environ.get("HF_HOME", "/app/models")
 MODEL_PATH = os.environ.get("MODEL_PATH", "/app/model")
+MODEL_BATCH_SIZE = int(os.environ.get("MODEL_BATCH_SIZE", "32"))
+MODEL_WARMUP = os.environ.get("MODEL_WARMUP", "false").lower() == "true"
+if MODEL_BATCH_SIZE < 1:
+    raise ValueError("MODEL_BATCH_SIZE must be positive")
 
 _model: SentenceTransformer | None = None
 
@@ -71,11 +78,13 @@ def _resolve_model_source() -> str:
 def get_model() -> SentenceTransformer:
     global _model
     if _model is None:
+        started = time.perf_counter()
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info("Loading model: %s (type=%s, device=%s)", MODEL_NAME, MODEL_TYPE, device)
         model_source = _resolve_model_source()
         _model = SentenceTransformer(model_source, trust_remote_code=True, device=device)
-        logger.info("Model loaded: %s on %s", MODEL_NAME, device)
+        logger.info("Model loaded: %s on %s in %.1f ms", MODEL_NAME, device,
+                    (time.perf_counter() - started) * 1000)
     return _model
 
 
@@ -150,7 +159,18 @@ def _normalize_inputs(raw_input: "str | EmbeddingInput | list") -> list[str | Im
 async def lifespan(_app: FastAPI):
     if not MODEL_NAME:
         raise RuntimeError("MODEL_NAME environment variable is required")
-    get_model()
+    model = get_model()
+    if MODEL_WARMUP:
+        started = time.perf_counter()
+        warmup_input = Image.new("RGB", (224, 224)) if MODEL_TYPE == "image" else "Embedding warmup"
+        await asyncio.to_thread(
+            model.encode, [warmup_input], batch_size=1,
+            normalize_embeddings=True, show_progress_bar=False,
+        )
+        logger.info("Model warmup completed: %s in %.1f ms", MODEL_NAME,
+                    (time.perf_counter() - started) * 1000)
+    logger.info("Worker ready: %s boot_to_ready_ms=%.1f", MODEL_NAME,
+                (time.perf_counter() - _BOOT_STARTED) * 1000)
     yield
 
 
@@ -165,11 +185,22 @@ async def health() -> HealthResponse:
 @app.post("/embed", response_model=EmbeddingResponse, responses={400: {"model": ErrorResponse}})
 async def embed(request: EmbeddingRequest) -> EmbeddingResponse:
     """Compute embeddings. Called internally by the gateway."""
+    # Image downloads, tokenization and result conversion must not block the
+    # event loop while other requests or health probes are being handled.
+    return await asyncio.to_thread(_embed, request)
+
+
+def _embed(request: EmbeddingRequest) -> EmbeddingResponse:
     model = get_model()
-
+    started = time.perf_counter()
     inputs = _normalize_inputs(request.input)
+    prepared = time.perf_counter()
 
-    embeddings = await asyncio.to_thread(model.encode, inputs, normalize_embeddings=True)
+    embeddings = model.encode(
+        inputs, batch_size=MODEL_BATCH_SIZE,
+        normalize_embeddings=True, show_progress_bar=False,
+    )
+    encoded = time.perf_counter()
 
     data = [
         EmbeddingObject(embedding=emb.tolist(), index=i)
@@ -179,8 +210,14 @@ async def embed(request: EmbeddingRequest) -> EmbeddingResponse:
     # Approximate token count (only for text inputs)
     total_tokens = sum(len(t.split()) for t in inputs if isinstance(t, str))
 
-    return EmbeddingResponse(
+    response = EmbeddingResponse(
         data=data,
         model=request.model,
         usage=Usage(prompt_tokens=total_tokens, total_tokens=total_tokens),
     )
+    logger.info(
+        "embedding_complete model=%s items=%d prepare_ms=%.1f encode_ms=%.1f total_ms=%.1f",
+        MODEL_NAME, len(inputs), (prepared - started) * 1000,
+        (encoded - prepared) * 1000, (time.perf_counter() - started) * 1000,
+    )
+    return response
