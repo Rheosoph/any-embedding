@@ -36,6 +36,13 @@ class EmbeddingRequest(BaseModel):
         default="float", description="Encoding format: 'float' or 'base64'."
     )
 
+    @field_validator("encoding_format")
+    @classmethod
+    def validate_encoding_format(cls, v: str) -> str:
+        if v not in ("float", "base64"):
+            raise ValueError("encoding_format must be 'float' or 'base64'")
+        return v
+
     @field_validator("input")
     @classmethod
     def validate_input_size(cls, v: "EmbeddingInputType") -> "EmbeddingInputType":
@@ -52,7 +59,13 @@ class EmbeddingRequest(BaseModel):
 
 class EmbeddingObject(BaseModel):
     object: str = "embedding"
-    embedding: list[float]
+    embedding: list[float] | str = Field(
+        ...,
+        description=(
+            "The embedding vector as a list of floats, or (encoding_format='base64') "
+            "the little-endian float32 bytes encoded as standard base64."
+        ),
+    )
     index: int
 
 

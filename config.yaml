@@ -11,36 +11,64 @@ models:
   # "type": "text" (default) or "image" (multimodal, e.g. CLIP).
   # Clients are responsible for adding any model-specific prefixes to their input.
   #
-  # Resource overrides (optional, defaults in terraform variables):
-  #   cpu, memory, gpu (bool), max_instances, min_instances, gated (bool)
-  # GCP serving overrides: concurrency, batch_size, warmup (bool), offline (bool)
-  # External model code can be baked with model_code_repo + model_code_revision.
+  # Identity / weights:
+  #   model_revision: 40-hex HF commit to bake (default: main at build time)
+  #   model_code_repo + model_code_revision: bake external custom code (trust_remote_code)
+  #   sentence_transformers_version, transformers_version: pin installed versions
+  #   gated (bool, default false): download requires HF_TOKEN with accepted license
+  #   max_tokens: caps model.max_seq_length (MODEL_MAX_SEQ_LENGTH); dimensions: embedding size
+  #
+  # Resources (defaults in terraform variables):
+  #   cpu (default "4"), memory (default "8Gi"), gpu (bool, default false),
+  #   max_instances, min_instances (default 0)
+  #
+  # Serving:
+  #   concurrency (default 4): Cloud Run requests per instance; sizes the worker executor
+  #   encode_parallelism (default 1): simultaneous model.encode calls per instance
+  #   batch_size (default 32): encode batch size
+  #   warmup (bool, default false): run a synthetic inference at startup
+  #   offline (bool, default false): HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE, never hit the Hub
+  #   prefetch (bool, default true): read weights + imports into the page cache at startup
+  #
+  # Numerics-changing knobs (opt-in; defaults keep embeddings identical):
+  #   dtype: float32 | float16 | bfloat16 (default float32)
+  #   matmul_precision: highest | high | medium (default highest, GPU only)
 
   - name: "bge-large-en-v1.5"
     model: "BAAI/bge-large-en-v1.5"
+    model_revision: "d4aa6901d3a41ba39fb536a557fa166f842b0e09"
     type: "text"
     max_tokens: 512
     dimensions: 1024
+    offline: true
 
   - name: "gte-large-en-v1.5"
     model: "Alibaba-NLP/gte-large-en-v1.5"
+    model_revision: "104333d6af6f97649377c2afbde10a7704870c7b"
     type: "text"
     max_tokens: 8192
     dimensions: 1024
     sentence_transformers_version: "2.7.0"
     transformers_version: "4.39.1"
+    model_code_repo: "Alibaba-NLP/new-impl"
+    model_code_revision: "40ced75c3017eb27626c9d4ea981bde21a2662f4"
+    offline: true
 
   - name: "e5-large-v2"
     model: "intfloat/e5-large-v2"
+    model_revision: "f169b11e22de13617baa190a028a32f3493550b6"
     type: "text"
     max_tokens: 512
     dimensions: 1024
+    offline: true
 
   - name: "qwen3-embedding-0.6b"
     model: "Qwen/Qwen3-Embedding-0.6B"
+    model_revision: "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3"
     type: "text"
     max_tokens: 32768
     dimensions: 1024
+    offline: true
     gpu: true
     cpu: "4"
     memory: "16Gi"
@@ -48,6 +76,7 @@ models:
 
   - name: "gte-multilingual-base"
     model: "Alibaba-NLP/gte-multilingual-base"
+    model_revision: "9bbca17d9273fd0d03d5725c7a4b0f6b45142062"
     type: "text"
     max_tokens: 8192
     dimensions: 768
@@ -61,17 +90,17 @@ models:
     memory: "16Gi"
     max_instances: 1
     min_instances: 0
-    # Bound simultaneous inference on the single L4. Four-way requests were
-    # exercised in deployment/aws/docs/benchmarks.md; tune for real batch sizes.
     concurrency: 4
     # Skip synthetic startup inference: the first real request initializes it.
     warmup: false
 
   - name: "multilingual-e5-large-instruct"
     model: "intfloat/multilingual-e5-large-instruct"
+    model_revision: "274baa43b0e13e37fafa6428dbc7938e62e5c439"
     type: "text"
     max_tokens: 512
     dimensions: 1024
+    offline: true
     gpu: true
     cpu: "4"
     memory: "16Gi"
@@ -80,51 +109,74 @@ models:
   # Gated model – requires HF_TOKEN with accepted license
   - name: "embeddinggemma-300m"
     model: "google/embeddinggemma-300m"
+    model_revision: "57c266a740f537b4dc058e1b0cda161fd15afa75"
     type: "text"
     gated: true
     max_tokens: 2048
     dimensions: 768
+    offline: true
     gpu: true
     cpu: "4"
     memory: "16Gi"
     max_instances: 1
 
-  # Jina v2 bilingual: EN/ZH – gated model, requires HF_TOKEN
   # Jina v2 custom code is incompatible with transformers>=4.46, pin older version.
+  # sentence-transformers 5.1.2 is the last release declaring transformers<5.
+  # Jina v2 bilingual: EN/ZH – gated model, requires HF_TOKEN
   - name: "jina-embeddings-v2-base-zh"
     model: "jinaai/jina-embeddings-v2-base-zh"
+    model_revision: "c1ff9086a89a1123d7b5eff58055a665db4fb4b9"
     type: "text"
     gated: true
     max_tokens: 8192
     dimensions: 768
     memory: "8Gi"
+    sentence_transformers_version: "5.1.2"
     transformers_version: "4.44.2"
+    model_code_repo: "jinaai/jina-bert-implementation"
+    model_code_revision: "f3ec4cf7de7e561007f27c9efc7148b0bd713f81"
+    offline: true
 
   # Jina v2 bilingual: DE/EN
   - name: "jina-embeddings-v2-base-de"
     model: "jinaai/jina-embeddings-v2-base-de"
+    model_revision: "3f9eede875721714945b6a99a3198299243cf2be"
     type: "text"
     max_tokens: 8192
     dimensions: 768
     memory: "8Gi"
+    sentence_transformers_version: "5.1.2"
     transformers_version: "4.44.2"
+    model_code_repo: "jinaai/jina-bert-implementation"
+    model_code_revision: "f3ec4cf7de7e561007f27c9efc7148b0bd713f81"
+    offline: true
 
   # Jina v2 bilingual: EN/ES
   - name: "jina-embeddings-v2-base-es"
     model: "jinaai/jina-embeddings-v2-base-es"
+    model_revision: "8e2d780d8fd38f81ca9123ee28e4c5a968aaf21e"
     type: "text"
     max_tokens: 8192
     dimensions: 768
     memory: "8Gi"
+    sentence_transformers_version: "5.1.2"
     transformers_version: "4.44.2"
+    model_code_repo: "jinaai/jina-bert-v2-qk-devlin-norm-1e-2"
+    model_code_revision: "d7eb81eb85ad2ef05cf3954e614c4fb6c9a898ce"
+    offline: true
 
   # Jina v2 code: EN + 30 programming languages
   - name: "jina-embeddings-v2-base-code"
     model: "jinaai/jina-embeddings-v2-base-code"
+    model_revision: "516f4baf13dec4ddddda8631e019b5737c8bc250"
     type: "text"
     max_tokens: 8192
     dimensions: 768
+    sentence_transformers_version: "5.1.2"
     transformers_version: "4.44.2"
+    model_code_repo: "jinaai/jina-bert-v2-qk-post-norm"
+    model_code_revision: "3baf9e3ac750e76e8edd3019170176884695fb94"
+    offline: true
 
   # Example: multimodal image+text model with GPU
   # - name: "clip-vit-large-patch14"

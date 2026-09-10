@@ -12,3 +12,13 @@ gateway_min_instances = 0
 worker_min_instances  = 0
 # Gateway auth + worker deadline: leave headroom below the consumer timeout.
 # worker_timeout_seconds = 120
+
+# Worker shape defaults; per-model cpu/memory/concurrency in config.yaml override.
+# worker_cpu         = "4"
+# worker_memory      = "8Gi"
+# worker_concurrency = 4
+# Cloud Run execution environment (GPU workers are always GEN2).
+# worker_execution_environment  = "EXECUTION_ENVIRONMENT_GEN2"
+# gateway_execution_environment = "EXECUTION_ENVIRONMENT_GEN1"
+# Per-client-IP requests per minute at the public edge.
+# gateway_rate_limit_rpm = 3000

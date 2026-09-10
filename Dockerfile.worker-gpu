@@ -3,72 +3,94 @@
 FROM python:3.12-slim AS model-downloader
 
 WORKDIR /app
-# Downloading weights and source code needs no inference runtime.
-RUN pip install --no-cache-dir "huggingface-hub>=0.20,<1.0"
+# Downloading weights and source code needs no inference runtime. The lower
+# bound provides the local_dir download mode used by download_model.py.
+RUN pip install --no-cache-dir "huggingface-hub>=0.23,<1.0"
 
-COPY app/ ./app/
+COPY app/gcp/download_model.py ./download_model.py
 
 ARG MODEL_NAME=""
+ARG MODEL_REVISION=""
 ARG MODEL_CODE_REPO=""
 ARG MODEL_CODE_REVISION=""
 ENV HF_HOME=/app/models
 ENV MODEL_PATH=/app/model
 RUN --mount=type=secret,id=HF_TOKEN \
-    mkdir -p /app/models && python app/gcp/download_model.py
+    mkdir -p /app/models && python download_model.py
 
-# Stage 2: GPU-enabled worker image using NVIDIA CUDA runtime.
-# Use this for models with gpu: true in config.yaml.
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
-
-# Prevent interactive prompts during apt install
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Install Python 3.12 + curl
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common curl && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-venv python3.12-dev && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
-    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
-    rm -rf /var/lib/apt/lists/*
+# Stage 2: GPU-enabled worker image. Use this for models with gpu: true in
+# config.yaml. The torch CUDA wheels vendor the complete CUDA runtime, so a
+# plain Python base image is enough; only the host driver is required.
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install PyTorch with CUDA support first (from PyTorch index), then the rest
+# UV_HTTP_TIMEOUT: multi-hundred-MB CUDA/torch wheels exceed uv's 30 s default on a busy link.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_NO_CACHE=1 \
+    UV_SYSTEM_PYTHON=1 \
+    UV_HTTP_TIMEOUT=300
+
+# curl is only needed by the docker-compose healthchecks. gcc is needed at
+# runtime: torch's bundled triton compiles a small CUDA driver helper on first
+# use, and newer architectures (Qwen3, Gemma3) reach that path during inference.
+RUN apt-get update && apt-get install -y --no-install-recommends curl gcc && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.12.8 /uv /usr/local/bin/uv
+
+# The CUDA torch wheel comes from the PyTorch index; everything else from PyPI.
+# Installing from pyproject.toml resolves the extra without building the project.
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir \
-        torch --index-url https://download.pytorch.org/whl/cu124 && \
-    pip install --no-cache-dir ".[worker]"
+RUN uv pip install torch --index-url https://download.pytorch.org/whl/cu126 && \
+    uv pip install -r pyproject.toml --extra worker
 
 # Optional: pin transformers version for models with compat issues (e.g. Jina v2)
 ARG SENTENCE_TRANSFORMERS_VERSION=""
 ARG TRANSFORMERS_VERSION=""
-RUN if [ -n "$SENTENCE_TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "sentence-transformers==$SENTENCE_TRANSFORMERS_VERSION"; fi && \
-    if [ -n "$TRANSFORMERS_VERSION" ]; then pip install --no-cache-dir "transformers==$TRANSFORMERS_VERSION"; fi
-
-COPY app/ ./app/
-COPY config.yaml ./
+RUN if [ -n "$SENTENCE_TRANSFORMERS_VERSION" ]; then uv pip install "sentence-transformers==$SENTENCE_TRANSFORMERS_VERSION"; fi && \
+    if [ -n "$TRANSFORMERS_VERSION" ]; then uv pip install "transformers==$TRANSFORMERS_VERSION"; fi
 
 RUN addgroup --system app && adduser --system --ingroup app app
+
+# Layer order: the model weights sit below the application code so that a code
+# change only rebuilds and re-pushes the small app layers, never the weights.
 COPY --from=model-downloader --chown=app:app /app/model /app/model
+RUN python -m compileall -q /app/model
 
+COPY app/__init__.py ./app/__init__.py
+COPY app/gcp/__init__.py app/gcp/worker.py ./app/gcp/
+COPY app/shared ./app/shared
+RUN python -m compileall -q /app/app
+
+# The app user is a system user, so its passwd home is /nonexistent.
+# Torch's bundled triton JIT-compiles kernels at inference and needs a
+# writable cache, so point HOME and the compiler caches at the tmpfs.
 ARG MODEL_NAME=""
-ENV MODEL_NAME=${MODEL_NAME}
-ENV MODEL_TYPE="text"
-ENV HF_HOME=/tmp/hf-home
-ENV MODEL_PATH=/app/model
-ENV HF_HUB_OFFLINE=1
-ENV TRANSFORMERS_OFFLINE=1
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV MODEL_NAME=${MODEL_NAME} \
+    MODEL_TYPE="text" \
+    HF_HOME=/tmp/hf-home \
+    MODEL_PATH=/app/model \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HOME=/tmp/app-home \
+    TRITON_CACHE_DIR=/tmp/triton-cache \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/inductor-cache \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# Compile app and bundled custom code while the image is built. Site packages
-# are already byte-compiled by pip.
-RUN python -m compileall -q /app/app /app/model
+# Record every module the worker imports so the runtime can prefetch them into
+# the page cache before torch is loaded (see MODEL_PREFETCH in worker.py). The
+# import runs as root, so point HF_HOME elsewhere and leave the runtime cache
+# directory owned by the app user (custom-code models write modules there).
+RUN HF_HOME=/tmp/manifest-hf-home MODEL_NAME=manifest MODEL_PREFETCH=false \
+        python -c "import app.gcp.worker as w; w.write_import_manifest('/app/import_manifest.txt')" && \
+    rm -rf /tmp/manifest-hf-home /tmp/hf-home && \
+    mkdir -p /tmp/hf-home && chown app:app /tmp/hf-home
+
 USER app
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.gcp.worker:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app.gcp.worker:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--no-server-header", "--timeout-keep-alive", "75"]

@@ -68,6 +68,16 @@ class EmbeddingRequestContractTests(unittest.TestCase):
 
         self.assertEqual(request.encoding_format, "base64")
 
+    def test_unknown_encoding_format_is_rejected(self) -> None:
+        for value in ("int8", "Float", "", "base-64"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValidationError, "encoding_format must be 'float' or 'base64'"
+                ):
+                    EmbeddingRequest(
+                        model="gte-multilingual-base", input="hello", encoding_format=value
+                    )
+
 
 class EmbeddingResponseContractTests(unittest.TestCase):
     def test_embedding_response_wire_shape(self) -> None:
@@ -92,6 +102,20 @@ class EmbeddingResponseContractTests(unittest.TestCase):
                 "usage": {"prompt_tokens": 1, "total_tokens": 1},
             },
         )
+
+    def test_embedding_object_accepts_base64_string_form(self) -> None:
+        encoded = "AACAPwAAAMAAAEBA"  # little-endian float32 [1.0, -2.0, 3.0]
+        item = EmbeddingObject(embedding=encoded, index=3)
+
+        self.assertEqual(
+            item.model_dump(),
+            {"object": "embedding", "embedding": encoded, "index": 3},
+        )
+        self.assertEqual(
+            EmbeddingObject(embedding=[1.0, -2.0], index=0).embedding, [1.0, -2.0]
+        )
+        with self.assertRaises(ValidationError):
+            EmbeddingObject(index=0)
 
     def test_health_response_keeps_null_model_field(self) -> None:
         self.assertEqual(

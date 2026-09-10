@@ -281,6 +281,8 @@ To re-apply Terraform without rebuilding images:
 mise run deploy:gcp:tf-only
 ```
 
+Every image is content-addressed: `deploy.py` hashes the Dockerfile, the files it copies, and the build arguments, and skips any image whose hash is already in the registry. A deploy after a config-only change therefore rebuilds nothing and only rolls the services whose settings changed. Use `--force-build` to rebuild anyway, `--parallel` (default 4) to bound concurrent image builds, and `--tf-parallelism` (default 1; raise it for CPU-only or gateway-only changes) to bound concurrent Cloud Run rollouts, which each start a verification instance that counts against the regional GPU quota. Set `BUILDX_BUILDER` or pass `--builder` so the `linux/amd64` images are built on a native amd64 node rather than under emulation.
+
 To test the deployed backend after rollout:
 
 ```bash

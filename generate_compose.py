@@ -16,6 +16,28 @@ GCP_WORKER_DOCKERFILES = {
     True: "Dockerfile.worker-gpu",
 }
 
+# Build args forwarded verbatim from config.yaml when set (config key -> ARG).
+WORKER_BUILD_ARGS = {
+    "model_revision": "MODEL_REVISION",
+    "sentence_transformers_version": "SENTENCE_TRANSFORMERS_VERSION",
+    "transformers_version": "TRANSFORMERS_VERSION",
+    "model_code_repo": "MODEL_CODE_REPO",
+    "model_code_revision": "MODEL_CODE_REVISION",
+}
+
+# Worker env forwarded verbatim from config.yaml when set (config key -> env var).
+# Mirrors deployment/gcp/main.tf; unset keys fall back to the worker's own defaults.
+WORKER_ENV_PASSTHROUGH = {
+    "batch_size": "MODEL_BATCH_SIZE",
+    "warmup": "MODEL_WARMUP",
+    "dtype": "MODEL_DTYPE",
+    "matmul_precision": "MODEL_MATMUL_PRECISION",
+    "max_tokens": "MODEL_MAX_SEQ_LENGTH",
+    "prefetch": "MODEL_PREFETCH",
+    "encode_parallelism": "WORKER_ENCODE_PARALLELISM",
+}
+DEFAULT_WORKER_CONCURRENCY = 4
+
 
 def sanitize_env_key(name: str) -> str:
     return "WORKER_URL_" + name.replace("-", "_").replace(".", "_").upper()
@@ -23,6 +45,38 @@ def sanitize_env_key(name: str) -> str:
 
 def sanitize_service_name(name: str) -> str:
     return "worker-" + name.replace(".", "-").lower()
+
+
+def env_value(value: object) -> str:
+    # Booleans become "true"/"false" as worker.py expects; everything else str().
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def worker_build_args(m: dict) -> dict[str, str]:
+    args = {"MODEL_NAME": m["model"]}
+    for key, arg in WORKER_BUILD_ARGS.items():
+        if m.get(key):
+            args[arg] = str(m[key])
+    return args
+
+
+def worker_environment(m: dict) -> dict[str, str]:
+    env = {
+        "MODEL_NAME": m["model"],
+        "MODEL_TYPE": m.get("type", "text"),
+    }
+    for key, var in WORKER_ENV_PASSTHROUGH.items():
+        if m.get(key) is not None:
+            env[var] = env_value(m[key])
+    env["WORKER_CONCURRENCY"] = str(m.get("concurrency") or DEFAULT_WORKER_CONCURRENCY)
+    # The images default to offline=1; Terraform defaults to offline=false, so
+    # always emit the resolved value to keep compose and Cloud Run in sync.
+    offline = "1" if m.get("offline", False) else "0"
+    env["HF_HUB_OFFLINE"] = offline
+    env["TRANSFORMERS_OFFLINE"] = offline
+    return env
 
 
 def main() -> None:
@@ -42,26 +96,16 @@ def main() -> None:
     for i, m in enumerate(models):
         svc_name = sanitize_service_name(m["name"])
         port = 8090 + i
-        model_type = m.get("type", "text")
         uses_gpu = m.get("gpu", False)
 
         svc: dict = {
             "build": {
                 "context": ".",
                 "dockerfile": GCP_WORKER_DOCKERFILES[uses_gpu],
-                "args": {
-                    "MODEL_NAME": m["model"],
-                    **({"SENTENCE_TRANSFORMERS_VERSION": m["sentence_transformers_version"]} if m.get("sentence_transformers_version") else {}),
-                    **({"TRANSFORMERS_VERSION": m["transformers_version"]} if m.get("transformers_version") else {}),
-                    **({"MODEL_CODE_REPO": m["model_code_repo"]} if m.get("model_code_repo") else {}),
-                    **({"MODEL_CODE_REVISION": m["model_code_revision"]} if m.get("model_code_revision") else {}),
-                },
+                "args": worker_build_args(m),
                 **({"secrets": ["hf_token"]} if hf_token else {}),
             },
-            "environment": {
-                "MODEL_NAME": m["model"],
-                "MODEL_TYPE": model_type,
-            },
+            "environment": worker_environment(m),
             "ports": [f"{port}:8080"],
             "healthcheck": {
                 "test": ["CMD", "curl", "-f", "http://localhost:8080/health"],

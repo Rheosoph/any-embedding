@@ -15,13 +15,13 @@ import logging
 import math
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import yaml
-from fastapi import FastAPI, HTTPException, Request, Security
+from fastapi import FastAPI, HTTPException, Request, Response, Security
 from fastapi.security import APIKeyHeader
 
 from app.shared.models import (
@@ -95,6 +95,11 @@ def _load_model_registry() -> dict[str, ModelConfig]:
     return registry
 
 
+def _worker_audience(model_cfg: ModelConfig) -> str:
+    """The audience of a worker's ID token is its base URL (no trailing slash)."""
+    return model_cfg["worker_url"].rstrip("/")
+
+
 _GCE_METADATA_URL = (
     "http://metadata.google.internal/computeMetadata/v1"
     "/instance/service-accounts/default/identity"
@@ -103,6 +108,17 @@ _GCE_METADATA_URL = (
 
 _TOKEN_EXPIRY_MARGIN_SECONDS = 60.0
 _METADATA_FAILURE_CACHE_SECONDS = 10.0
+_TOKEN_PREFETCH_TIMEOUT_SECONDS = 2.0
+
+# Cloud Run's own idle timeout for HTTPS keepalives is well above this; the
+# httpx default (5 s) forces a fresh TLS handshake to run.app on nearly every
+# request under sparse traffic.
+_WORKER_CONNECT_TIMEOUT_SECONDS = 10.0
+_WORKER_CLIENT_LIMITS = httpx.Limits(
+    max_connections=200,
+    max_keepalive_connections=100,
+    keepalive_expiry=300.0,
+)
 
 
 def _worker_timeout_seconds() -> float:
@@ -180,7 +196,9 @@ class _IDTokenProvider:
                 return token
         finally:
             elapsed_ms = round((time.monotonic() - started) * 1000, 2)
-            logger.info(
+            # Cache hits are the steady state; keep them out of INFO noise.
+            logger.log(
+                logging.DEBUG if outcome == "cache_hit" else logging.INFO,
                 "id_token_lookup outcome=%s elapsed_ms=%.2f",
                 outcome,
                 elapsed_ms,
@@ -195,24 +213,100 @@ async def _get_id_token(audience: str) -> str | None:
     return await app.state.id_token_provider.get_token(audience)
 
 
+async def _prefetch_id_tokens(
+    provider: _IDTokenProvider, registry: dict[str, ModelConfig]
+) -> None:
+    """Warm the token cache so the first request per worker skips metadata.
+
+    Best effort: a slow or absent metadata server must never delay or fail
+    startup, so the whole batch is bounded by one short deadline.
+    """
+    audiences = sorted({_worker_audience(cfg) for cfg in registry.values()})
+    if not audiences:
+        return
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(provider.get_token(a) for a in audiences)),
+            timeout=_TOKEN_PREFETCH_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "id_token_prefetch outcome=timeout audiences=%d timeout_s=%.1f",
+            len(audiences),
+            _TOKEN_PREFETCH_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - startup must survive any failure
+        logger.warning(
+            "id_token_prefetch outcome=error audiences=%d error=%s",
+            len(audiences),
+            type(exc).__name__,
+        )
+    else:
+        logger.info(
+            "id_token_prefetch outcome=done audiences=%d elapsed_ms=%.2f",
+            len(audiences),
+            round((time.monotonic() - started) * 1000, 2),
+        )
+
+
 MODEL_REGISTRY: dict[str, ModelConfig] = {}
 
 # --- Rate limiting (in-memory sliding window) --------------------------------
 
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "300"))
-_request_log: dict[str, list[float]] = defaultdict(list)
+# Only a trusted reverse proxy (Cloud Run) may vouch for the client address;
+# exposed directly, X-Forwarded-For is caller-supplied and must be ignored.
+TRUST_X_FORWARDED_FOR = os.environ.get("TRUST_X_FORWARDED_FOR", "false").strip().lower() in ("true", "1", "yes")
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_request_log: dict[str, deque[float]] = defaultdict(deque)
+_request_log_swept_at = 0.0
+
+
+def _client_ip(request: Request) -> str:
+    """Identify the caller behind the Cloud Run proxy.
+
+    Cloud Run appends the connecting client's address as the LAST entry of
+    X-Forwarded-For; earlier entries are client-supplied and spoofable. The
+    TCP peer (request.client) is the proxy itself there, so it is only a
+    fallback. Without a trusted proxy the TCP peer is the client.
+    """
+    forwarded_for = request.headers.get("x-forwarded-for", "") if TRUST_X_FORWARDED_FOR else ""
+    if forwarded_for:
+        rightmost = forwarded_for.rsplit(",", 1)[-1].strip()
+        if rightmost:
+            return rightmost
+    return request.client.host if request.client else "unknown"
+
+
+def _prune_timestamps(timestamps: deque[float], now: float) -> None:
+    while timestamps and now - timestamps[0] >= _RATE_LIMIT_WINDOW_SECONDS:
+        timestamps.popleft()
+
+
+def _sweep_request_log(now: float) -> None:
+    """Drop idle clients at most once per window so the map cannot grow forever."""
+    global _request_log_swept_at
+    if now - _request_log_swept_at < _RATE_LIMIT_WINDOW_SECONDS:
+        return
+    _request_log_swept_at = now
+    for client_ip, timestamps in list(_request_log.items()):
+        _prune_timestamps(timestamps, now)
+        if not timestamps:
+            del _request_log[client_ip]
 
 
 def _check_rate_limit(client_ip: str) -> None:
-    """Enforce per-IP sliding-window rate limit."""
+    """Enforce per-client sliding-window rate limit."""
     now = time.monotonic()
-    window = 60.0
+    _sweep_request_log(now)
     timestamps = _request_log[client_ip]
-    # Prune expired entries
-    _request_log[client_ip] = [t for t in timestamps if now - t < window]
-    if len(_request_log[client_ip]) >= RATE_LIMIT_RPM:
+    _prune_timestamps(timestamps, now)
+    if len(timestamps) >= RATE_LIMIT_RPM:
+        if not timestamps:
+            del _request_log[client_ip]
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    _request_log[client_ip].append(now)
+    timestamps.append(now)
 
 
 @asynccontextmanager
@@ -221,12 +315,16 @@ async def lifespan(_app: FastAPI):
     timeout = _worker_timeout_seconds()
     MODEL_REGISTRY = _load_model_registry()
     async with (
-        httpx.AsyncClient(timeout=timeout) as worker_client,
+        httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=_WORKER_CONNECT_TIMEOUT_SECONDS),
+            limits=_WORKER_CLIENT_LIMITS,
+        ) as worker_client,
         httpx.AsyncClient(timeout=5.0) as metadata_client,
     ):
         _app.state.worker_client = worker_client
         _app.state.id_token_provider = _IDTokenProvider(metadata_client)
         _app.state.worker_timeout_seconds = timeout
+        await _prefetch_id_tokens(_app.state.id_token_provider, MODEL_REGISTRY)
         logger.info("Gateway ready with %d model(s)", len(MODEL_REGISTRY))
         yield
 
@@ -240,11 +338,22 @@ audit_logger.setLevel(logging.INFO)
 
 
 def _audit_log(request: Request, model: str | None, status: int) -> None:
-    """Emit structured audit log entry for every API call."""
+    """Emit structured audit log entry for every API call.
+
+    Fields are rendered into the message because the default log format does
+    not print 'extra' attributes; they are kept as attributes for structured
+    handlers.
+    """
+    client_ip = _client_ip(request)
     audit_logger.info(
-        "api_request",
+        "api_request client_ip=%s method=%s path=%s model=%s status=%s",
+        client_ip,
+        request.method,
+        request.url.path,
+        model,
+        status,
         extra={
-            "client_ip": request.client.host if request.client else "unknown",
+            "client_ip": client_ip,
             "method": request.method,
             "path": request.url.path,
             "model": model,
@@ -287,8 +396,8 @@ async def create_embeddings(
     http_request: Request,
     request: EmbeddingRequest,
     _key: str = Security(verify_api_key),
-) -> EmbeddingResponse:
-    _check_rate_limit(http_request.client.host if http_request.client else "unknown")
+) -> Response:
+    _check_rate_limit(_client_ip(http_request))
 
     model_cfg = MODEL_REGISTRY.get(request.model)
     if model_cfg is None:
@@ -299,7 +408,7 @@ async def create_embeddings(
             detail=f"Model '{request.model}' not found. Available: {available}",
         )
 
-    worker_url = model_cfg["worker_url"].rstrip("/")
+    worker_url = _worker_audience(model_cfg)
 
     started = time.monotonic()
     worker_started: float | None = None
@@ -354,4 +463,12 @@ async def create_embeddings(
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
     _audit_log(http_request, request.model, 200)
-    return EmbeddingResponse(**resp.json())
+    # The worker already produced a validated OpenAI-shaped body (float or
+    # base64). Re-parsing it here cost ~100x the forwarding time and ~128 MB
+    # per large request, so hand the bytes through untouched. Only the media
+    # type is copied: Starlette computes content-length for the decoded body.
+    return Response(
+        content=resp.content,
+        status_code=200,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )

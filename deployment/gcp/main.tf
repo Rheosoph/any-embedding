@@ -10,6 +10,32 @@ locals {
       : "ae-w-${substr(replace(name, ".", "-"), 0, 37)}-${substr(md5(name), 0, 6)}"
     )
   }
+
+  # Per-model settings resolved against the Terraform defaults, so the worker
+  # resource and its env vars read from one place.
+  worker_settings = {
+    for name, m in local.models : name => {
+      gpu         = try(m.gpu, false)
+      cpu         = tostring(try(m.cpu, var.worker_cpu))
+      memory      = try(m.memory, var.worker_memory)
+      concurrency = try(m.concurrency, var.worker_concurrency)
+      # Thread budget for torch/OpenMP/tokenizers: os.cpu_count() reports the
+      # host CPU count on Cloud Run gen2, so the container must be told its
+      # cgroup quota. Accepts "4", "0.5" or millicore "2000m"; fractional
+      # limits round up to one thread.
+      cpu_threads = tostring(ceil(
+        endswith(tostring(try(m.cpu, var.worker_cpu)), "m")
+        ? tonumber(trimsuffix(tostring(try(m.cpu, var.worker_cpu)), "m")) / 1000
+        : tonumber(tostring(try(m.cpu, var.worker_cpu)))
+      ))
+      encode_parallelism = tostring(try(m.encode_parallelism, 1))
+      dtype              = try(m.dtype, "float32")
+      matmul_precision   = try(m.matmul_precision, "highest")
+      max_seq_length     = tostring(try(m.max_tokens, 0))
+      prefetch           = tostring(try(m.prefetch, true))
+      offline            = try(m.offline, false) ? "1" : "0"
+    }
+  }
 }
 
 resource "google_project_service" "required" {
@@ -156,7 +182,7 @@ resource "google_cloud_run_v2_service" "worker" {
   name         = local.worker_service_names[each.key]
   location     = var.region
   ingress      = "INGRESS_TRAFFIC_ALL"
-  launch_stage = try(each.value.gpu, false) ? "BETA" : "GA"
+  launch_stage = local.worker_settings[each.key].gpu ? "BETA" : "GA"
 
   deletion_protection = var.cloud_run_deletion_protection
 
@@ -174,9 +200,14 @@ resource "google_cloud_run_v2_service" "worker" {
   }
 
   template {
-    service_account                  = google_service_account.worker.email
-    gpu_zonal_redundancy_disabled    = try(each.value.gpu, false)
-    max_instance_request_concurrency = try(each.value.concurrency, 80)
+    service_account               = google_service_account.worker.email
+    gpu_zonal_redundancy_disabled = local.worker_settings[each.key].gpu
+    # GPU workers require gen2; CPU workers follow the variable.
+    execution_environment = local.worker_settings[each.key].gpu ? "EXECUTION_ENVIRONMENT_GEN2" : var.worker_execution_environment
+    # Autoscaling targets 60% of this value. Torch inference on 2-4 vCPUs gains
+    # nothing from overlapping encodes, so keep it low to scale out instead of
+    # queueing on one instance.
+    max_instance_request_concurrency = local.worker_settings[each.key].concurrency
 
     scaling {
       min_instance_count = try(each.value.min_instances, var.worker_min_instances)
@@ -185,7 +216,7 @@ resource "google_cloud_run_v2_service" "worker" {
 
     # GPU support: attach an NVIDIA L4 when gpu=true in config
     dynamic "node_selector" {
-      for_each = try(each.value.gpu, false) ? [1] : []
+      for_each = local.worker_settings[each.key].gpu ? [1] : []
       content {
         accelerator = "nvidia-l4"
       }
@@ -199,14 +230,14 @@ resource "google_cloud_run_v2_service" "worker" {
       resources {
         limits = merge(
           {
-            cpu    = try(each.value.cpu, var.worker_cpu)
-            memory = try(each.value.memory, var.worker_memory)
+            cpu    = local.worker_settings[each.key].cpu
+            memory = local.worker_settings[each.key].memory
           },
-          try(each.value.gpu, false) ? { "nvidia.com/gpu" = "1" } : {}
+          local.worker_settings[each.key].gpu ? { "nvidia.com/gpu" = "1" } : {}
         )
         # GPU workers: instance-based billing (CPU always allocated, required for GPU)
         # CPU-only workers: request-based billing (CPU only during requests → scale-to-zero saves)
-        cpu_idle          = !try(each.value.gpu, false)
+        cpu_idle          = !local.worker_settings[each.key].gpu
         startup_cpu_boost = true
       }
 
@@ -232,11 +263,58 @@ resource "google_cloud_run_v2_service" "worker" {
       }
       env {
         name  = "HF_HUB_OFFLINE"
-        value = try(each.value.offline, false) ? "1" : "0"
+        value = local.worker_settings[each.key].offline
       }
       env {
         name  = "TRANSFORMERS_OFFLINE"
-        value = try(each.value.offline, false) ? "1" : "0"
+        value = local.worker_settings[each.key].offline
+      }
+      env {
+        name  = "HF_HUB_DISABLE_TELEMETRY"
+        value = "1"
+      }
+
+      # Thread budget: torch, OpenMP/MKL and the Rust tokenizers each read
+      # their own variable, so all four carry the same value.
+      env {
+        name  = "WORKER_CPU_LIMIT"
+        value = local.worker_settings[each.key].cpu_threads
+      }
+      env {
+        name  = "OMP_NUM_THREADS"
+        value = local.worker_settings[each.key].cpu_threads
+      }
+      env {
+        name  = "MKL_NUM_THREADS"
+        value = local.worker_settings[each.key].cpu_threads
+      }
+      env {
+        name  = "RAYON_NUM_THREADS"
+        value = local.worker_settings[each.key].cpu_threads
+      }
+      env {
+        name  = "WORKER_CONCURRENCY"
+        value = tostring(local.worker_settings[each.key].concurrency)
+      }
+      env {
+        name  = "WORKER_ENCODE_PARALLELISM"
+        value = local.worker_settings[each.key].encode_parallelism
+      }
+      env {
+        name  = "MODEL_DTYPE"
+        value = local.worker_settings[each.key].dtype
+      }
+      env {
+        name  = "MODEL_MATMUL_PRECISION"
+        value = local.worker_settings[each.key].matmul_precision
+      }
+      env {
+        name  = "MODEL_MAX_SEQ_LENGTH"
+        value = local.worker_settings[each.key].max_seq_length
+      }
+      env {
+        name  = "MODEL_PREFETCH"
+        value = local.worker_settings[each.key].prefetch
       }
 
       dynamic "env" {
@@ -282,14 +360,17 @@ resource "google_cloud_run_v2_service" "worker" {
         container_port = 8080
       }
 
+      # uvicorn opens the port only after the model is loaded, so readiness is
+      # detected up to one probe period late; probe every second. The 240 s
+      # budget is the Cloud Run maximum (p95 start-to-ready measured 31 s).
       startup_probe {
         http_get {
           path = "/health"
         }
-        initial_delay_seconds = 5
-        period_seconds        = 5
-        failure_threshold     = 24
-        timeout_seconds       = 3
+        initial_delay_seconds = 0
+        period_seconds        = 1
+        failure_threshold     = 240
+        timeout_seconds       = 1
       }
     }
 
@@ -322,7 +403,8 @@ resource "google_cloud_run_v2_service" "gateway" {
   depends_on = [google_project_service.required["run.googleapis.com"]]
 
   template {
-    service_account = google_service_account.gateway.email
+    service_account       = google_service_account.gateway.email
+    execution_environment = var.gateway_execution_environment
 
     scaling {
       min_instance_count = var.gateway_min_instances
@@ -354,6 +436,16 @@ resource "google_cloud_run_v2_service" "gateway" {
         name  = "WORKER_TIMEOUT_SECONDS"
         value = tostring(var.worker_timeout_seconds)
       }
+      env {
+        name  = "RATE_LIMIT_RPM"
+        value = tostring(var.gateway_rate_limit_rpm)
+      }
+      # Cloud Run's proxy appends the real client as the last X-Forwarded-For
+      # entry; only there may the gateway key its rate limit on that header.
+      env {
+        name  = "TRUST_X_FORWARDED_FOR"
+        value = "true"
+      }
 
       # Inject worker URLs as environment variables: WORKER_URL_<SANITIZED_NAME>
       dynamic "env" {
@@ -372,10 +464,10 @@ resource "google_cloud_run_v2_service" "gateway" {
         http_get {
           path = "/health"
         }
-        initial_delay_seconds = 2
-        period_seconds        = 3
-        failure_threshold     = 5
-        timeout_seconds       = 2
+        initial_delay_seconds = 0
+        period_seconds        = 1
+        failure_threshold     = 60
+        timeout_seconds       = 1
       }
     }
     # Leave time for the gateway to return its own upstream timeout response.

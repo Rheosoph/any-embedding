@@ -1,11 +1,33 @@
-__pycache__/
-*.pyc
+# Caches and build artifacts at any depth (patterns without **/ only match the context root)
+**/__pycache__
+**/*.py[co]
+**/node_modules
+**/dist
+**/build
+**/*.egg-info
 .venv/
-node_modules/
+.direnv/
+.DS_Store
+
+# Not part of any Google Cloud image
+app/aws/
+.git
+.github
+.codacy
+tests/
+deployment/
+*.md
+docker-compose.yaml
+uv.lock
+mise.toml
+main.py
+test.sh
+generate_compose.py
+
+# Secrets and local credentials
 .env
 .env.*
 .envrc
-.direnv/
 .aws/
 .gcloud/
 .secrets/
@@ -17,11 +39,9 @@ node_modules/
 *.pem
 *.p12
 *.pfx
-*.egg-info/
-dist/
-build/
+
+# Terraform state
 **/.terraform/
 *.tfstate
 *.tfstate.backup
 .terraform.lock.hcl
-deployment/

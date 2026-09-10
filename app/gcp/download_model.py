@@ -5,11 +5,26 @@ from __future__ import annotations
 import ast
 import json
 import os
+import posixpath
 import re
 import shutil
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
+
+# Alternative export formats and documentation assets that the PyTorch runtime
+# never reads. Hub repositories frequently ship every format side by side, which
+# would otherwise triple the size of the weight layer.
+ALWAYS_IGNORE = (
+    "onnx/*", "onnx/**", "openvino/*", "openvino/**", "*.onnx", "*.onnx_data",
+    "coreml/**", "*.mlpackage/**", "*.gguf", "*.tflite", "*.msgpack", "*.h5", "*.ot",
+    "images/*", "images/**", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ipynb", ".gitattributes",
+)
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt")
+# Pickle weight formats that transformers only loads when no safetensors file
+# exists in the same directory.
+PICKLE_WEIGHT_SUFFIXES = (".bin", ".pt", ".pth", ".ckpt")
+COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 def _load_secret(name: str) -> str:
@@ -19,6 +34,72 @@ def _load_secret(name: str) -> str:
         with open(path) as f:
             return f.read().strip()
     return os.environ.get(name, "")
+
+
+def build_ignore_patterns(files: list[str]) -> list[str]:
+    """Return snapshot_download ignore patterns for a listed repository.
+
+    Pickle weights are skipped only where a safetensors file sits in the same
+    directory, so sub-modules that ship nothing else (e.g. ``2_Dense/``) keep
+    their weights.
+    """
+    patterns = list(ALWAYS_IGNORE)
+    safetensors_dirs = {posixpath.dirname(path) for path in files if path.endswith(".safetensors")}
+    for path in files:
+        if path.endswith(PICKLE_WEIGHT_SUFFIXES) and posixpath.dirname(path) in safetensors_dirs:
+            patterns.append(path)
+    return patterns
+
+
+def inspect_repo(model_name: str, revision: str, hf_token: str) -> tuple[str, list[str]]:
+    """Resolve the commit and file listing of a Hub repository with one request."""
+    info = HfApi(token=hf_token or None).model_info(model_name, revision=revision or None)
+    return info.sha or "", sorted(sibling.rfilename for sibling in info.siblings or [])
+
+
+def list_weight_files(model_path: Path) -> list[Path]:
+    """Return every weight file under the model directory."""
+    return sorted(
+        path for path in model_path.rglob("*")
+        if path.is_file() and path.name.endswith(WEIGHT_SUFFIXES)
+    )
+
+
+def report_files(model_path: Path) -> int:
+    """Print the materialized files with sizes and return the total in bytes."""
+    total = 0
+    for path in sorted(p for p in model_path.rglob("*") if p.is_file()):
+        size = path.stat().st_size
+        total += size
+        print(f"  {path.relative_to(model_path).as_posix()}  {size / 2**20:.1f} MiB")
+    print(f"Model files total: {total / 2**20:.1f} MiB")
+    return total
+
+
+def warn_about_unpinned_remote_code(model_path: Path) -> bool:
+    """Warn when auto_map points at another repository that is not baked in."""
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        auto_map = json.loads(config_path.read_text()).get("auto_map")
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    if not isinstance(auto_map, dict):
+        return False
+    references = [
+        item for value in auto_map.values()
+        for item in (value if isinstance(value, list) else [value])
+        if isinstance(item, str) and "--" in item
+    ]
+    if not references:
+        return False
+    print(
+        "WARNING: config.json auto_map references external custom code "
+        f"({', '.join(sorted(set(references)))}). It will be fetched from the Hub at runtime; "
+        "set model_code_repo and model_code_revision in config.yaml to bake it into the image."
+    )
+    return True
 
 
 def _validate_local_modules(model_path: Path, modules: set[str]) -> None:
@@ -56,7 +137,7 @@ def localize_remote_code(
     model_path: Path, code_repo: str, code_revision: str, cache_folder: str, hf_token: str,
 ) -> None:
     """Bake an explicitly pinned external auto_map repository into the model."""
-    if not code_repo or not re.fullmatch(r"[0-9a-f]{40}", code_revision):
+    if not code_repo or not COMMIT_PATTERN.fullmatch(code_revision):
         raise ValueError("MODEL_CODE_REPO and a full 40-character MODEL_CODE_REVISION commit are required together")
     config_path = model_path / "config.json"
     config = json.loads(config_path.read_text())
@@ -109,8 +190,35 @@ def localize_remote_code(
     print(f"Custom model code materialized: {code_repo}@{code_revision}")
 
 
+def download_weights(model_name: str, model_revision: str, model_path: Path, hf_token: str) -> None:
+    """Download the runtime subset of a model repository straight into model_path."""
+    commit, files = inspect_repo(model_name, model_revision, hf_token)
+    ignore_patterns = build_ignore_patterns(files)
+    print(f"Downloading model: {model_name}@{commit or model_revision or 'main'}")
+    if model_path.is_dir():
+        shutil.rmtree(model_path)
+    snapshot_download(
+        repo_id=model_name,
+        revision=model_revision or None,
+        local_dir=str(model_path),
+        token=hf_token or None,
+        ignore_patterns=ignore_patterns,
+        max_workers=8,
+    )
+    # huggingface_hub keeps download metadata next to the files; it is dead weight at runtime.
+    shutil.rmtree(model_path / ".cache", ignore_errors=True)
+    if not list_weight_files(model_path):
+        raise ValueError(
+            f"no model weights were downloaded for {model_name}: expected a file matching "
+            f"{', '.join('*' + suffix for suffix in WEIGHT_SUFFIXES)} under {model_path}"
+        )
+    print(f"Model files for {model_name}:")
+    report_files(model_path)
+
+
 def main() -> None:
     model_name = os.environ.get("MODEL_NAME", "")
+    model_revision = os.environ.get("MODEL_REVISION", "")
     cache_folder = os.environ.get("HF_HOME", "/app/models")
     model_path = Path(os.environ.get("MODEL_PATH", "/app/model"))
     code_repo = os.environ.get("MODEL_CODE_REPO", "")
@@ -125,23 +233,17 @@ def main() -> None:
         print("No MODEL_NAME set, skipping download")
         return
 
+    if model_revision and not COMMIT_PATTERN.fullmatch(model_revision):
+        raise ValueError("MODEL_REVISION must be a full 40-character commit hash")
     if (code_repo or code_revision) and (
-        not code_repo or not re.fullmatch(r"[0-9a-f]{40}", code_revision)
+        not code_repo or not COMMIT_PATTERN.fullmatch(code_revision)
     ):
         raise ValueError("MODEL_CODE_REPO and a full 40-character MODEL_CODE_REVISION commit are required together")
-    print(f"Downloading model: {model_name}")
-    snapshot_path = snapshot_download(
-        repo_id=model_name,
-        cache_dir=cache_folder,
-        token=hf_token or None,
-        local_files_only=False,
-    )
-    if model_path.is_dir():
-        shutil.rmtree(model_path)
-    shutil.copytree(snapshot_path, model_path)
+    download_weights(model_name, model_revision, model_path, hf_token)
     if code_repo:
         localize_remote_code(model_path, code_repo, code_revision, cache_folder, hf_token)
-    print(f"Model cached: {model_name} -> {snapshot_path}")
+    else:
+        warn_about_unpinned_remote_code(model_path)
     print(f"Model materialized for runtime: {model_name} -> {model_path}")
 
 

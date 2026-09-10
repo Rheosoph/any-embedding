@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 import httpx
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from app.gcp import gateway
@@ -137,10 +139,24 @@ class IDTokenProviderTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await provider.get_token(WORKER_URL), invalid_token)
                 self.assertEqual(len(calls), 2)
 
+    async def test_cache_hit_is_logged_at_debug_and_refresh_at_info(self) -> None:
+        provider = self.provider(
+            lambda request: httpx.Response(200, text=token(time.time() + 3600))
+        )
+        with self.assertLogs(gateway.logger, "DEBUG") as logs:
+            await provider.get_token(WORKER_URL)
+            await provider.get_token(WORKER_URL)
+        records = [r for r in logs.records if r.msg.startswith("id_token_lookup")]
+        self.assertEqual(
+            [(r.outcome, r.levelno) for r in records],
+            [("refreshed", logging.INFO), ("cache_hit", logging.DEBUG)],
+        )
+
 
 class GatewayForwardingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.clients = []
+        self.client_kwargs = []
         self.worker_requests = []
         self.metadata_requests = []
         self.id_token = token(time.time() + 3600)
@@ -149,8 +165,9 @@ class GatewayForwardingTests(unittest.TestCase):
         gateway._request_log.clear()
 
     @contextmanager
-    def client(self, timeout="120"):
+    def client(self, timeout="120", registry=None, prefetch_timeout=None):
         async_client = httpx.AsyncClient
+        registry = registry if registry is not None else {MODEL: {"worker_url": WORKER_URL}}
 
         async def worker_transport(request):
             self.worker_requests.append(request)
@@ -166,22 +183,27 @@ class GatewayForwardingTests(unittest.TestCase):
             transport = worker_transport if not self.clients else metadata_transport
             client = async_client(transport=httpx.MockTransport(transport), **kwargs)
             self.clients.append(client)
+            self.client_kwargs.append(kwargs)
             return client
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(gateway, "API_KEY", API_KEY))
             stack.enter_context(patch.dict("os.environ", {"WORKER_TIMEOUT_SECONDS": timeout}))
             stack.enter_context(patch.object(
-                gateway, "_load_model_registry", return_value={MODEL: {"worker_url": WORKER_URL}}
+                gateway, "_load_model_registry", return_value=registry
             ))
             stack.enter_context(patch.object(gateway.httpx, "AsyncClient", side_effect=make_client))
+            if prefetch_timeout is not None:
+                stack.enter_context(patch.object(
+                    gateway, "_TOKEN_PREFETCH_TIMEOUT_SECONDS", prefetch_timeout
+                ))
             yield stack.enter_context(TestClient(gateway.app))
 
-    def post(self, client):
+    def post(self, client, headers=None, **body):
         return client.post(
             "/v1/embeddings",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            json={"model": MODEL, "input": INPUT_TEXT},
+            headers={"Authorization": f"Bearer {API_KEY}", **(headers or {})},
+            json={"model": MODEL, "input": INPUT_TEXT, **body},
         )
 
     def test_clients_and_token_are_reused_and_clients_close_on_shutdown(self) -> None:
@@ -203,6 +225,19 @@ class GatewayForwardingTests(unittest.TestCase):
             self.assertEqual(request.headers["Authorization"], f"Bearer {self.id_token}")
             self.assertEqual(json.loads(request.content)["input"], INPUT_TEXT)
 
+    def test_worker_client_keeps_connections_warm_and_bounds_connect_time(self) -> None:
+        with self.client(timeout="90"):
+            pass
+        worker_kwargs, metadata_kwargs = self.client_kwargs
+        limits = worker_kwargs["limits"]
+        self.assertEqual(limits.max_connections, 200)
+        self.assertEqual(limits.max_keepalive_connections, 100)
+        self.assertEqual(limits.keepalive_expiry, 300.0)
+        timeout = worker_kwargs["timeout"]
+        self.assertEqual(timeout.connect, 10.0)
+        self.assertEqual((timeout.read, timeout.write, timeout.pool), (90.0, 90.0, 90.0))
+        self.assertEqual(metadata_kwargs, {"timeout": 5.0})
+
     def test_metadata_unavailable_still_allows_local_workers_without_repeated_lookup(self) -> None:
         def unavailable(request):
             raise httpx.ConnectError("metadata not available", request=request)
@@ -211,6 +246,7 @@ class GatewayForwardingTests(unittest.TestCase):
         with self.client() as client:
             self.assertEqual(self.post(client).status_code, 200)
             self.assertEqual(self.post(client).status_code, 200)
+        # The startup prefetch consumes the single attempt; requests back off.
         self.assertEqual(len(self.metadata_requests), 1)
         self.assertTrue(all("Authorization" not in r.headers for r in self.worker_requests))
 
@@ -249,17 +285,19 @@ class GatewayForwardingTests(unittest.TestCase):
 
     def test_total_deadline_includes_metadata_and_releases_refresh_lock(self) -> None:
         async def metadata(request):
-            if len(self.metadata_requests) == 1:
+            # Stall the startup prefetch and the first forwarded request.
+            if len(self.metadata_requests) <= 2:
                 await asyncio.sleep(60)
             return httpx.Response(200, text=self.id_token)
 
         self.metadata_handler = metadata
-        with self.client(timeout="0.02") as client:
+        with self.client(timeout="0.02", prefetch_timeout=0.02) as client:
+            self.assertEqual(len(self.metadata_requests), 1)
             response = self.post(client)
             self.assertEqual(response.status_code, 504)
             self.assertEqual(len(self.worker_requests), 0)
             self.assertEqual(self.post(client).status_code, 200)
-        self.assertEqual(len(self.metadata_requests), 2)
+        self.assertEqual(len(self.metadata_requests), 3)
         self.assertEqual(len(self.worker_requests), 1)
 
     def test_worker_http_error_preserves_existing_status_and_detail(self) -> None:
@@ -269,14 +307,147 @@ class GatewayForwardingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json(), {"detail": "worker warming"})
 
+    def test_worker_4xx_body_is_mapped_into_detail(self) -> None:
+        self.worker_handler = lambda request: httpx.Response(
+            400, json={"error": {"message": "bad input"}}
+        )
+        with self.client() as client:
+            response = self.post(client)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"detail": '{"error":{"message":"bad input"}}'})
+
+    def test_worker_body_is_passed_through_byte_for_byte(self) -> None:
+        # Not valid for EmbeddingResponse (base64 embedding, extra key, odd
+        # whitespace): the gateway must not parse or re-serialize it.
+        body = (
+            b'{"object":"list","data":[{"object":"embedding",'
+            b'"embedding":"AACAPwAAAMA=","index":0}],"model":"' + MODEL.encode() +
+            b'",  "usage":{"prompt_tokens":1,"total_tokens":1},"extra":null}\n'
+        )
+        self.worker_handler = lambda request: httpx.Response(
+            200,
+            content=body,
+            headers={
+                "content-type": "application/json; charset=utf-8",
+                "content-encoding": "identity",
+                "transfer-encoding": "chunked",
+                "x-worker": "internal",
+            },
+        )
+        with self.client() as client:
+            response = self.post(client, encoding_format="base64")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, body)
+        self.assertEqual(response.headers["content-type"], "application/json; charset=utf-8")
+        self.assertEqual(response.headers["content-length"], str(len(body)))
+        self.assertNotIn("content-encoding", response.headers)
+        self.assertNotIn("transfer-encoding", response.headers)
+        self.assertNotIn("x-worker", response.headers)
+        self.assertEqual(json.loads(self.worker_requests[0].content)["encoding_format"], "base64")
+
+    def test_passthrough_defaults_to_json_media_type(self) -> None:
+        body = b'{"object":"list","data":[],"model":"m","usage":{"prompt_tokens":0,"total_tokens":0}}'
+        self.worker_handler = lambda request: httpx.Response(200, content=body)
+        with self.client() as client:
+            response = self.post(client)
+        self.assertNotIn("content-type", self.worker_handler(None).headers)
+        self.assertEqual(response.content, body)
+        self.assertEqual(response.headers["content-type"], "application/json")
+
+    def test_startup_prefetches_worker_tokens(self) -> None:
+        registry = {
+            MODEL: {"worker_url": WORKER_URL + "/"},
+            "other": {"worker_url": "https://other.example"},
+        }
+        self.metadata_handler = lambda request: httpx.Response(
+            200, text=token(time.time() + 3600, request.url.params["audience"])
+        )
+        with self.assertLogs(gateway.logger, "INFO") as logs, self.client(registry=registry) as client:
+            audiences = sorted(r.url.params["audience"] for r in self.metadata_requests)
+            self.assertEqual(audiences, ["https://other.example", WORKER_URL])
+            self.assertEqual(
+                set(gateway.app.state.id_token_provider.tokens), set(audiences)
+            )
+            self.assertEqual(self.post(client).status_code, 200)
+        self.assertEqual(len(self.metadata_requests), 2)
+        token_logs = [r for r in logs.records if r.msg.startswith("id_token_lookup")]
+        self.assertEqual([r.outcome for r in token_logs], ["refreshed", "refreshed"])
+        prefetch_logs = [r.getMessage() for r in logs.records if r.msg.startswith("id_token_prefetch")]
+        self.assertEqual(len(prefetch_logs), 1)
+        self.assertIn("outcome=done audiences=2", prefetch_logs[0])
+        self.assert_logs_are_safe(logs.records)
+
+    def test_startup_prefetch_timeout_does_not_block_startup_or_requests(self) -> None:
+        async def metadata(request):
+            if len(self.metadata_requests) == 1:
+                await asyncio.sleep(60)
+            return httpx.Response(200, text=self.id_token)
+
+        self.metadata_handler = metadata
+        started = time.monotonic()
+        with self.assertLogs(gateway.logger, "INFO") as logs, self.client(prefetch_timeout=0.02) as client:
+            self.assertLess(time.monotonic() - started, 5.0)
+            self.assertEqual(self.post(client).status_code, 200)
+            self.assertEqual(self.post(client).status_code, 200)
+        self.assertEqual(len(self.metadata_requests), 2)
+        self.assertEqual(self.worker_requests[0].headers["Authorization"], f"Bearer {self.id_token}")
+        prefetch_logs = [r for r in logs.records if r.msg.startswith("id_token_prefetch")]
+        self.assertEqual([r.levelno for r in prefetch_logs], [logging.WARNING])
+        self.assertIn("outcome=timeout", prefetch_logs[0].getMessage())
+
+    def test_startup_prefetch_is_skipped_without_workers(self) -> None:
+        with self.client(registry={}):
+            pass
+        self.assertEqual(self.metadata_requests, [])
+
+    def test_rate_limit_keys_on_rightmost_forwarded_for_entry(self) -> None:
+        with (
+            patch.object(gateway, "RATE_LIMIT_RPM", 2),
+            patch.object(gateway, "TRUST_X_FORWARDED_FOR", True),
+            self.client() as client,
+        ):
+            first = {"X-Forwarded-For": "203.0.113.1"}
+            second = {"X-Forwarded-For": "203.0.113.2"}
+            self.assertEqual(self.post(client, headers=first).status_code, 200)
+            self.assertEqual(self.post(client, headers=first).status_code, 200)
+            self.assertEqual(self.post(client, headers=first).status_code, 429)
+            # A different client behind the same proxy peer is independent.
+            self.assertEqual(self.post(client, headers=second).status_code, 200)
+            # Client-supplied leading entries cannot dodge the limit.
+            spoofed = {"X-Forwarded-For": "198.51.100.9, 203.0.113.1"}
+            self.assertEqual(self.post(client, headers=spoofed).status_code, 429)
+            # Without the header the TCP peer remains the key.
+            self.assertEqual(self.post(client).status_code, 200)
+            self.assertEqual(self.post(client).status_code, 200)
+            self.assertEqual(self.post(client).status_code, 429)
+        self.assertEqual(sorted(gateway._request_log), ["203.0.113.1", "203.0.113.2", "testclient"])
+
+    def test_audit_log_message_carries_fields(self) -> None:
+        with (
+            patch.object(gateway, "TRUST_X_FORWARDED_FOR", True),
+            self.client() as client,
+            self.assertLogs(gateway.audit_logger, "INFO") as logs,
+        ):
+            self.post(client, headers={"X-Forwarded-For": "10.1.1.1, 203.0.113.7"})
+            self.post(client, model="missing")
+        messages = [r.getMessage() for r in logs.records]
+        self.assertEqual(messages, [
+            f"api_request client_ip=203.0.113.7 method=POST path=/v1/embeddings model={MODEL} status=200",
+            "api_request client_ip=testclient method=POST path=/v1/embeddings model=missing status=400",
+        ])
+        self.assert_logs_are_safe(logs.records)
+
     def test_timing_logs_do_not_include_input_credentials_or_tokens(self) -> None:
-        with self.client() as client, self.assertLogs(gateway.logger, "INFO") as logs:
+        with self.client() as client, self.assertLogs(gateway.logger, "DEBUG") as logs:
             self.assertEqual(self.post(client).status_code, 200)
             self.assertEqual(self.post(client).status_code, 200)
         token_logs = [r for r in logs.records if r.msg.startswith("id_token_lookup")]
         forward_logs = [r for r in logs.records if r.msg.startswith("worker_forward")]
-        self.assertEqual([r.outcome for r in token_logs], ["refreshed", "cache_hit"])
+        # The refresh happened during startup; both requests hit the cache.
+        self.assertEqual([r.outcome for r in token_logs], ["cache_hit", "cache_hit"])
+        self.assertTrue(all(r.levelno == logging.DEBUG for r in token_logs))
         self.assertEqual(len(forward_logs), 2)
+        self.assertTrue(all(r.levelno == logging.INFO for r in forward_logs))
         self.assertTrue(all(r.elapsed_ms >= 0 for r in logs.records))
         self.assertTrue(all(r.worker_elapsed_ms >= 0 for r in forward_logs))
         self.assertTrue(all("elapsed_ms=" in r.getMessage() for r in logs.records))
@@ -287,6 +458,86 @@ class GatewayForwardingTests(unittest.TestCase):
         serialized = repr([record.__dict__ for record in records])
         for sensitive in (API_KEY, INPUT_TEXT, self.id_token):
             self.assertNotIn(sensitive, serialized)
+
+
+class ClientIdentityTests(unittest.TestCase):
+    @staticmethod
+    def request(headers: dict[str, str] | None = None, client=("10.0.0.9", 4321)) -> Request:
+        return Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/embeddings",
+            "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
+            "client": client,
+        })
+
+    def test_forwarded_for_is_ignored_without_a_trusted_proxy(self) -> None:
+        # The default: exposed directly (docker compose, plain uvicorn) the
+        # header is caller-supplied, so the TCP peer stays the key.
+        self.assertFalse(gateway.TRUST_X_FORWARDED_FOR)
+        request = self.request({"X-Forwarded-For": "203.0.113.1"})
+        self.assertEqual(gateway._client_ip(request), "10.0.0.9")
+
+    def test_rightmost_forwarded_for_entry_wins(self) -> None:
+        cases = {
+            "203.0.113.1": "203.0.113.1",
+            "198.51.100.9, 203.0.113.1": "203.0.113.1",
+            "198.51.100.9,203.0.113.1 ": "203.0.113.1",
+            " 2001:db8::1 ": "2001:db8::1",
+        }
+        for header, expected in cases.items():
+            with self.subTest(header=header), patch.object(gateway, "TRUST_X_FORWARDED_FOR", True):
+                self.assertEqual(
+                    gateway._client_ip(self.request({"X-Forwarded-For": header})), expected
+                )
+
+    def test_falls_back_to_peer_then_unknown(self) -> None:
+        with patch.object(gateway, "TRUST_X_FORWARDED_FOR", True):
+            self.assertEqual(gateway._client_ip(self.request()), "10.0.0.9")
+            self.assertEqual(gateway._client_ip(self.request({"X-Forwarded-For": " "})), "10.0.0.9")
+            self.assertEqual(gateway._client_ip(self.request(client=None)), "unknown")
+
+
+class RateLimitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        gateway._request_log.clear()
+        gateway._request_log_swept_at = 0.0
+
+    def check(self, client_ip: str, now: float) -> int | None:
+        with patch.object(gateway.time, "monotonic", return_value=now):
+            try:
+                gateway._check_rate_limit(client_ip)
+            except gateway.HTTPException as exc:
+                return exc.status_code
+        return None
+
+    def test_expired_timestamps_are_popped_from_the_left(self) -> None:
+        with patch.object(gateway, "RATE_LIMIT_RPM", 3):
+            self.assertIsNone(self.check("a", 1000.0))
+            self.assertIsNone(self.check("a", 1010.0))
+            self.assertIsNone(self.check("a", 1020.0))
+            self.assertEqual(self.check("a", 1059.0), 429)
+            self.assertEqual(list(gateway._request_log["a"]), [1000.0, 1010.0, 1020.0])
+            # The entry from t=1000 has aged out; the others remain in order.
+            self.assertIsNone(self.check("a", 1060.0))
+            self.assertEqual(list(gateway._request_log["a"]), [1010.0, 1020.0, 1060.0])
+            self.assertIsInstance(gateway._request_log["a"], gateway.deque)
+
+    def test_idle_clients_are_dropped_once_per_window(self) -> None:
+        with patch.object(gateway, "RATE_LIMIT_RPM", 10):
+            self.assertIsNone(self.check("idle", 1000.0))
+            self.assertIsNone(self.check("busy", 1001.0))
+            # Within the sweep window idle keys are kept even when expired.
+            self.assertIsNone(self.check("busy", 1059.5))
+            self.assertIn("idle", gateway._request_log)
+            self.assertIsNone(self.check("busy", 1061.0))
+            self.assertEqual(sorted(gateway._request_log), ["busy"])
+            self.assertEqual(list(gateway._request_log["busy"]), [1059.5, 1061.0])
+
+    def test_zero_limit_leaves_no_empty_keys(self) -> None:
+        with patch.object(gateway, "RATE_LIMIT_RPM", 0):
+            self.assertEqual(self.check("a", 1000.0), 429)
+        self.assertEqual(dict(gateway._request_log), {})
 
 
 class WorkerTimeoutConfigurationTests(unittest.TestCase):
